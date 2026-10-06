@@ -37,7 +37,8 @@ def _build_tts(args):
             kw["device"] = args.device
     return TTS(backend=args.backend, model_dir=args.model_dir,
                ref_wav=args.ref, ref_text=args.ref_text,
-               use_cache=not args.no_cache, **kw)
+               use_cache=not args.no_cache,
+               localize=not getattr(args, "no_localize", False), **kw)
 
 
 # CUDA / DirectML 下每次冷启动都要重付"加载 + 预热"的代价
@@ -107,6 +108,10 @@ def cmd_say(args):
 
     tts = _build_tts(args)
     r = tts.say(text, seed=args.seed, out=out, verbose=True)
+    # 英文被转成中文读法时告诉用户实际念的是什么 ——
+    # 否则用户听到"基皮尤"会以为念错了，其实是输入里写的 GPU
+    if getattr(r, "spoken", text) != text:
+        print(f"  实际合成: {r.spoken}")
     print(f"{r.duration:.2f}s  ->  {os.path.abspath(out)}")
     return 0
 
@@ -216,6 +221,9 @@ def main(argv=None):
     ap.add_argument("--ref-text", default=None, help="参考音频对应文本")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-cache", action="store_true", help="禁用合成缓存")
+    ap.add_argument("--no-localize", action="store_true",
+                    help="不把英文转成中文读法（默认转换；"
+                         "不转换时英文会被文本前端静默删除）")
     ap.add_argument("--gsv-root", default=None,
                     help="GPT-SoVITS 检出目录（torch 后端需要）")
     ap.add_argument("--device", default=None, help="torch 后端设备: cuda/cpu")

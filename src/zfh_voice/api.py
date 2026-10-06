@@ -7,13 +7,17 @@
     r.save("out.wav")
 
 缓存：以 (文本, 后端, 参考音频, seed) 为键，命中直接返回，避免重复合成。
+
+英文处理：中文文本前端会**静默删掉英文**（见 textprep 模块头），
+所以合成前统一走一遍 textprep.localize()，把英文转成中文读法。
 """
 import hashlib
 import json
 import os
+import re
 import time
 
-from . import audio, paths
+from . import audio, paths, textprep
 from .backends import make_backend
 
 DEFAULT_REF_NAME = "ref/default.wav"
@@ -22,12 +26,22 @@ DEFAULT_REF_TEXT_NAME = "ref/default.txt"
 # 随模型包一起分发的默认参考音频（若无则回落到内置示例）
 FALLBACK_REF_TEXT = "再好的武器，也得朝夕相处磨合上几天。等用惯了，我再和你说说感受，好吗？"
 
+# 前端能发音的内容：汉字或数字。
+# 数字/符号前端会自己转写（3→三、￥100→幺零零、50%→百分之五十），
+# 所以算"可发音"；只有标点或纯 ASCII 字母（未转换时）会产出 0 音素。
+_SPEAKABLE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf0-9]")
+
+
+def _has_speakable(text):
+    return bool(_SPEAKABLE.search(text or ""))
+
 
 class SynthResult:
     def __init__(self, wav, sr, text, cached=False, seconds=0.0, backend=""):
         self.wav = wav
         self.sr = sr
-        self.text = text
+        self.text = text              # 用户原始输入
+        self.spoken = text            # 实际送去合成的文本（英文已转中文读法）
         self.cached = cached
         self.seconds = seconds
         self.backend = backend
@@ -54,13 +68,16 @@ class SynthResult:
 
 class TTS:
     def __init__(self, backend="onnx", model_dir=None, cache_dir=None,
-                 ref_wav=None, ref_text=None, use_cache=True, **backend_kw):
+                 ref_wav=None, ref_text=None, use_cache=True, localize=True,
+                 **backend_kw):
         self._backend_kind = backend
         # 按后端分别校验：onnx 后端必须有 7 个 ONNX；
         # torch 后端只认 .ckpt/.pth，**不要求 ONNX 存在**（两者互不通用）
         require = "onnx" if backend == "onnx" else None
         self.model_dir = paths.resolve_model_dir(model_dir, require=require)
         self.use_cache = use_cache
+        # 英文转中文读法：默认开。关掉的话英文会被前端静默删除
+        self.localize = localize
         self._backend_kw = backend_kw
         self._backend = None
 
@@ -154,36 +171,56 @@ class TTS:
         return n
 
     # ---------- 合成 ----------
-    def say(self, text, seed=None, out=None, use_cache=None, verbose=False):
-        """合成一句，返回 SynthResult"""
+    def say(self, text, seed=None, out=None, use_cache=None, verbose=False,
+            localize=None):
+        """合成一句，返回 SynthResult
+
+        localize: 是否把文本里的英文转成中文读法（默认跟随 self.localize）。
+                  **必须做** —— 中文文本前端会**静默删掉**英文
+                  （chinese2.py: `re.sub("[a-zA-Z]+", "", seg)`），
+                  不转换的话 `GPU`、`Hello` 会被整句吃掉。
+        """
         text = (text or "").strip()
         if not text:
             raise ValueError("文本为空")
+        do_localize = self.localize if localize is None else localize
+        spoken = textprep.localize(text) if do_localize else text
+        # 提前拦住"念不出声"的输入 —— 否则后端会产出 0 音素并抛出
+        # 难以理解的底层错误（如 "need at least one array to concatenate"）。
+        if not _has_speakable(spoken):
+            raise ValueError(
+                f"文本里没有可发音的内容：{text!r}。"
+                "中文前端只能念汉字与数字；"
+                + ("纯符号请换一句。" if do_localize else
+                   "纯英文需启用英文转换（TTS(localize=True)，默认已启用）。"))
         use_cache = self.use_cache if use_cache is None else use_cache
-        key = self._cache_key(text, seed)
+        # 缓存键用**转换后**的文本：同一句的不同写法若读法相同，可复用
+        key = self._cache_key(spoken, seed)
         cp = self._cache_path(key)
 
         if use_cache and os.path.exists(cp):
             wav, sr = audio.load_wav(cp)
             r = SynthResult(wav, sr, text, cached=True, backend=self._backend_kind)
+            r.spoken = spoken
             if out:
                 r.save(out)
             return r
 
         t0 = time.time()
         wav, sr = self.backend.synth(
-            text, self.ref_wav, self.ref_text, seed=seed, verbose=verbose)
+            spoken, self.ref_wav, self.ref_text, seed=seed, verbose=verbose)
         dt = time.time() - t0
         wav = audio.peak_normalize(wav, 0.95)
         if use_cache:
             audio.save_wav(cp, wav, sr)
         r = SynthResult(wav, sr, text, cached=False, seconds=dt,
                         backend=self._backend_kind)
+        r.spoken = spoken
         if out:
             r.save(out)
         return r
 
-    def say_many(self, texts, out_dir, seed=None, verbose=True):
+    def say_many(self, texts, out_dir, seed=None, verbose=True, localize=None):
         """批量合成，返回结果列表"""
         os.makedirs(out_dir, exist_ok=True)
         out = []
@@ -192,7 +229,7 @@ class TTS:
             if not t:
                 continue
             p = os.path.join(out_dir, f"{i:03d}.wav")
-            r = self.say(t, seed=seed, out=p, verbose=False)
+            r = self.say(t, seed=seed, out=p, verbose=False, localize=localize)
             out.append(r)
             if verbose:
                 mark = "缓存" if r.cached else f"{r.seconds:.1f}s"

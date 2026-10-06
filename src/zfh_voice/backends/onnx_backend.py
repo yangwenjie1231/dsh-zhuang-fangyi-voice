@@ -73,7 +73,6 @@ class OnnxBackend(SynthBackend):
     def _text_ids(self, text):
         ids, w2p, norm = frontend.text_to_ids(text, "zh", VERSION)
         return np.array([ids], dtype=np.int64), w2p, norm
-
     def _bert_feature(self, norm_text, word2ph):
         enc = self.tokenizer(norm_text, return_tensors="np")
         ids = enc["input_ids"].astype(np.int64)

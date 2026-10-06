@@ -159,6 +159,9 @@ def make_handler(tts, state=None):
                 "sr": r.sr, "cached": r.cached,
                 "elapsed": round(time.time() - t0, 3),
                 "cold_start": not was_loaded,
+                # 实际送去合成的文本（英文已转成中文读法）。
+                # 与请求里的 text 不同时，调用方可据此告诉用户"实际念的是什么"。
+                "spoken": getattr(r, "spoken", text),
                 "wav_base64": base64.b64encode(r.to_wav_bytes()).decode()})
 
     return Handler
