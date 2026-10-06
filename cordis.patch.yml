@@ -1,0 +1,17 @@
+# dsh-zhuang-fangyi-voice bundle patch: registers the plugin row so the package
+# appears in the Loader entries.
+#
+# 注册成一个独立条目 `zhuang-fangyi-voice`：
+#   · 与桌宠 `dsh-zhuang-fangyi-pet` 是**两个独立插件** —— 语音不依赖桌宠，
+#     桌宠也不依赖语音（没装语音插件时桌宠退回固定台词）；
+#   · 启用后它会把 `zfhVoice` 服务挂到宿主上，桌宠通过 `ctx.get('zfhVoice')`
+#     拿到"把一句话合成成语音"的能力。
+- insert:
+    - id: zhuang-fangyi-voice
+      name: 'dsh-zhuang-fangyi-voice'
+      config:
+        # 全部留空 = 自动：后端用子插件默认，python 从 PATH / .venv 找，
+        # 仓库目录就是本插件自己的目录（插件知道自己装在哪，不需要绝对路径）。
+        backend: auto
+        resident: false
+        idleStopSec: 300

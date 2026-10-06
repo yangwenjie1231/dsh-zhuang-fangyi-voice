@@ -153,6 +153,49 @@ tts = TTS(ref_wav="my_ref.wav", ref_text="这段音频里说的那句话")
 
 ---
 
+## 装成 DSH 插件（推荐）
+
+本仓库除了是 Python 库，**也是一个 DSH 插件**：`index.js` 是它的宿主半边，
+负责托管推理服务的进程（启动/保活/空闲释放显存），并把合成能力挂成宿主服务
+**`zfhVoice`** —— 桌宠插件用它把 AI 的回答念出来。
+
+```powershell
+# 1) 装 Python 依赖与模型（见「快速开始」）
+# 2) 复制插件到 DSH profile
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-dsh-plugin.ps1
+# 3) 重启 DSH（ESM 模块有缓存，disable→enable 对入口文件不够）
+```
+
+装好后宿主日志会出现「庄方宜语音：已挂载 zfhVoice 服务」。
+
+**给 AI 助手用的安装提示词**：`docs/安装提示词.md` —— 整段复制给
+Claude Code / Cursor / DSH 自己，它会按步骤配好环境（含每一步的确认标志）。
+
+### 插件配置（全部可选，留空即自动）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `python` | 自动 | 找 `.venv` → `ZFH_VOICE_PYTHON` → PATH |
+| `repoDir` | 插件自身目录 | 插件知道自己装在哪，**不需要绝对路径** |
+| `backend` | `auto` | `auto` / `torch`（快，占显存）/ `onnx`（慢，省显存） |
+| `gsvRoot` | 自动 | GPT-SoVITS 检出目录（torch 后端需要） |
+| `modelDir` | 自动 | 等价 `ZFH_MODEL_DIR` |
+| `host` / `port` | `127.0.0.1` / `8765` | 本地 HTTP 服务 |
+| `resident` | `false` | **常驻**：一直占显存但合成立刻开始；关闭则空闲后释放 |
+| `idleStopSec` | `300` | 非常驻时空闲多久停掉（0 = 不停） |
+
+### 两条纪律（有测试盯着）
+
+- **只停自己起的**：用户在终端手动 `python -m zfh_voice serve` 时，
+  插件只连接、绝不终止；
+- **秒退不重启**：依赖没装/模型缺失时自动重启会变成重启风暴 ——
+  10 秒内退出只记错误，等用户显式操作。
+
+自测：`node tools/test-plugin.mjs`（30 项，覆盖 python 解析/命令组装/
+决策矩阵/监管器）。
+
+---
+
 ## 与桌宠集成
 
 桌宠侧只需调用 HTTP 接口，无需关心本仓库的实现细节：
