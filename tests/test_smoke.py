@@ -61,10 +61,12 @@ def test_synth_short_text():
 
 
 @requires_models
-def test_cache_hit_is_fast():
+def test_cache_hit_is_fast(tmp_path):
     from zfh_voice import TTS
 
-    tts = TTS()
+    # 用独立缓存目录，避免被上一次运行的残留缓存干扰
+    # （否则第一次 say 就直接命中，断言 not r1.cached 会假失败）
+    tts = TTS(cache_dir=str(tmp_path / "cache"))
     try:
         text = "缓存测试：这句话应该被缓存。"
         r1 = tts.say(text, use_cache=True)

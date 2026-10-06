@@ -28,12 +28,19 @@ FALLBACK_REF_TEXT = "再好的武器，也得朝夕相处磨合上几天。等�
 
 # 前端能发音的内容：汉字或数字。
 # 数字/符号前端会自己转写（3→三、￥100→幺零零、50%→百分之五十），
-# 所以算"可发音"；只有标点或纯 ASCII 字母（未转换时）会产出 0 音素。
+# 所以算"可发音"。英文字母是否算，取决于走哪条路（见 _has_speakable）。
 _SPEAKABLE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf0-9]")
+_SPEAKABLE_LATIN = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf0-9A-Za-z]")
 
 
-def _has_speakable(text):
-    return bool(_SPEAKABLE.search(text or ""))
+def _has_speakable(text, allow_latin=False):
+    """文本里有没有能发音的内容
+
+    allow_latin=True 表示英文段能产出音素（中英混排可用时），
+    此时纯英文/含英文的句子是可发音的。
+    """
+    rx = _SPEAKABLE_LATIN if allow_latin else _SPEAKABLE
+    return bool(rx.search(text or ""))
 
 
 class SynthResult:
@@ -68,7 +75,7 @@ class SynthResult:
 
 class TTS:
     def __init__(self, backend="onnx", model_dir=None, cache_dir=None,
-                 ref_wav=None, ref_text=None, use_cache=True, localize=True,
+                 ref_wav=None, ref_text=None, use_cache=True, localize="auto",
                  **backend_kw):
         self._backend_kind = backend
         # 按后端分别校验：onnx 后端必须有 7 个 ONNX；
@@ -76,8 +83,11 @@ class TTS:
         require = "onnx" if backend == "onnx" else None
         self.model_dir = paths.resolve_model_dir(model_dir, require=require)
         self.use_cache = use_cache
-        # 英文转中文读法：默认开。关掉的话英文会被前端静默删除
+        # 英文怎么念：auto（默认）/ True（转中文读法）/ False（原样送前端）
+        #   auto → 中英混排可用时**原样送**（真英文发音，实测更好）；
+        #          不可用时转中文读法兜底（否则英文会被静默删掉）
         self.localize = localize
+        self._localize_auto = None      # 惰性求值，避免构造时就加载前端
         self._backend_kw = backend_kw
         self._backend = None
 
@@ -112,6 +122,45 @@ class TTS:
         if os.path.exists(p):
             return open(p, encoding="utf-8").read().strip()
         return FALLBACK_REF_TEXT
+
+    # ---------- 英文处理策略 ----------
+    def _resolve_localize(self, override=None):
+        """这一句要不要把英文转成中文读法
+
+        `localize` 语义：
+          · "auto"（默认）→ 中英混排可用时**原样送**（真英文发音，实测更准）；
+                            不可用时转中文读法兜底（否则英文被静默删掉）
+          · True  → 总是转（纯离线、零 nltk 依赖）
+          · False → 总是不转（英文交给前端分段处理）
+
+        ⚠️ 注意 `"auto"` 是**字符串**，不能直接 `bool()` ——
+        `bool("auto")` 是 True，会把"自动"误判成"总是转换"。
+        """
+        if override is not None:
+            return self._decide_localize(override)
+        if isinstance(self.localize, str):
+            return self._decide_localize(self.localize)
+        return bool(self.localize)
+
+    def _decide_localize(self, value):
+        """把 'auto' / True / False 解析成"这一句是否转换" """
+        if isinstance(value, str):
+            if value.strip().lower() != "auto":
+                # 未知字符串按 auto 处理，避免静默改变行为
+                pass
+            else:
+                return self._auto_localize()
+        return bool(value)
+
+    def _auto_localize(self):
+        """中英混排可用 → 不转换（用真英文念）；否则转换（兜底）"""
+        if self._localize_auto is None:
+            try:
+                from . import frontend
+                self._localize_auto = not frontend.mixed_available()
+            except Exception:
+                self._localize_auto = True
+        return self._localize_auto
 
     # ---------- 后端 ----------
     @property
@@ -183,16 +232,21 @@ class TTS:
         text = (text or "").strip()
         if not text:
             raise ValueError("文本为空")
-        do_localize = self.localize if localize is None else localize
+        do_localize = self._resolve_localize(localize)
         spoken = textprep.localize(text) if do_localize else text
         # 提前拦住"念不出声"的输入 —— 否则后端会产出 0 音素并抛出
         # 难以理解的底层错误（如 "need at least one array to concatenate"）。
-        if not _has_speakable(spoken):
+        #
+        # 判定要区分两条路：
+        #   · 中英混排可用 → 英文段能走 english.py 产出音素，所以**英文也算可发音**
+        #   · 不可用（英文会被前端删掉）→ 只有汉字/数字算可发音
+        allow_latin = not do_localize
+        if not _has_speakable(spoken, allow_latin=allow_latin):
             raise ValueError(
                 f"文本里没有可发音的内容：{text!r}。"
-                "中文前端只能念汉字与数字；"
-                + ("纯符号请换一句。" if do_localize else
-                   "纯英文需启用英文转换（TTS(localize=True)，默认已启用）。"))
+                + ("纯符号请换一句。" if allow_latin else
+                   "当前环境不支持英文发音（缺 nltk/g2p_en 等），"
+                   "请设 TTS(localize=True) 用中文读法念英文。"))
         use_cache = self.use_cache if use_cache is None else use_cache
         # 缓存键用**转换后**的文本：同一句的不同写法若读法相同，可复用
         key = self._cache_key(spoken, seed)

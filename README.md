@@ -135,9 +135,11 @@ curl -X POST http://127.0.0.1:8765/tts \
 
 ---
 
-## 英文与数字怎么念
+## 中英混排怎么念
 
-**中文文本前端会静默删掉英文** —— 这是 GPT-SoVITS `chinese2.py` 的行为：
+### 问题：直接调中文前端会**静默删掉**英文
+
+GPT-SoVITS 的中文前端 `chinese2.py` 有这一行：
 
 ```python
 processed_segments = [re.sub("[a-zA-Z]+", "", seg) for seg in segments]
@@ -150,41 +152,67 @@ processed_segments = [re.sub("[a-zA-Z]+", "", seg) for seg in segments]
 |---|---:|---|
 | `今天天气不错。` | 13 | — |
 | `今天天气不错，Hello World。` | **13** | 英文没产生任何音素 |
-| `Hello World`（纯英文） | **0** | 合成直接报错 |
+| `Hello world, this is a test.` | **0** | 合成直接报错 |
 
-### 本库的处理：转成中文读法
+**根因不是模型不会英文** —— 是**绕过了上游的 `LangSegmenter`**。
+上游 `TextPreprocessor` 会先按语言分段：
 
-`TTS(localize=True)`（**默认开启**）会在合成前把英文换成等效中文读法：
+```
+今天天气不错，Hello World，我已经整理好了。
+  → zh:'今天天气不错，' + en:'Hello World，' + zh:'我已经整理好了。'
+```
 
-| 输入 | 实际合成 |
-|---|---|
-| `GPU 和 AI 都很重要。` | `基皮尤 和 诶艾 都很重要。` |
-| `今天天气不错，Hello World。` | `今天天气不错，哈喽 达布流欧阿尔艾勒迪。` |
-| `这个是 Python 写的程序。` | `这个是 派森 写的程序。` |
-| `API 返回了 JSON 格式的数据。` | `诶皮艾 返回了 杰森 格式的数据。` |
+英文段走 `en`（g2p_en + cmudict，产出 ARPAbet 音素），中文段走 `zh`。
+**参考音频只提供音色（`ge` 向量），音素用哪种语言与音色无关** ——
+所以"中文音色 + 英文发音"成立，实测音色相似度 0.62，与纯中文相当。
 
-规则：**常见词查表** → **全大写缩写逐字母念** → **其余逐字母念**（保底）。
-数字与符号**不动** —— 前端本来就能正确处理
-（`3`→`三`、`￥100`→`幺零零`、`50%`→`百分之五十`）。
+### 本库的处理
 
-> 设计取向：**宁可念得笨拙，也不要静默丢失**。听到"基-皮-尤"能明白，
-> 听到一片空白只会以为坏了。
+`frontend.text_to_segments()` 走 `LangSegmenter` 分段，两个后端都用它：
 
-实测 `GPU 和 AI 都很重要。` 合成后，ASR 反查把读音**还原成了 `GPU和AI`** ——
-说明读音准确到能被反向识别。
+| 输入 | ASR 反查结果 | 英文还原 |
+|---|---|---|
+| `Hello world, this is a test.` | `Hello world, this is a test.` | **6/6** |
+| `GPU 和 AI 都很重要。` | `GPU和AI都很重要` | **2/2** |
+| `OK, no problem.` | `Okay, no problem.` | **3/3** |
+| `这个功能叫 Hello World，很简单。` | `这个功能叫Hello World很简单` | **2/2** |
+| `今天的实验数据我已经整理好了。` | 中文完整 | — |
 
 ```bash
 python -m zfh_voice say "GPU 和 AI 都很重要。"
-#   实际合成: 基皮尤 和 诶艾 都很重要。
-#   2.56s  ->  out/out.wav
-
-python -m zfh_voice say "Hello" --no-localize   # 关掉转换（英文会被丢弃）
+# 3.40s  ->  out/out.wav
 ```
 
-`/tts.json` 响应带 `spoken` 字段（实际送去合成的文本），
-调用方可据此告诉用户"实际念的是什么"。
+### 所需数据**随包分发，不需要联网**
 
-**想扩充词表**：改 [src/zfh_voice/textprep.py](src/zfh_voice/textprep.py) 的 `WORDS`。
+| 数据 | 体积 | 位置 |
+|---|---:|---|
+| `cmudict.rep` / `cmudict-fast.rep` | 7.4 MB | `_vendor/_gsv_text/`（`english.py` 读） |
+| nltk tagger（词性标注） | 5.4 MB | `_vendor/nltk_data/`（`prepare()` 设 `NLTK_DATA`） |
+| `lid.176.ftz`（语言检测） | 916 KB | 随 `fast-langdetect` 包 |
+
+> **不装这些依赖也能跑**，但英文会被前端静默删除。
+> 装法：`pip install nltk g2p-en wordsegment fast-langdetect split-lang`
+
+### 两条兜底
+
+1. **`localize` 参数**（默认 `"auto"`）：
+   - `"auto"` → 混排可用时**原样送**（真英文发音）；不可用时自动转中文读法兜底
+   - `True` → 总是转中文读法（`GPU`→`基皮尤`）—— 纯离线、零 nltk 依赖
+   - `False` → 总是不转
+2. 转换实现见 [src/zfh_voice/textprep.py](src/zfh_voice/textprep.py)（词表可自行扩充）
+
+### 踩过的坑（供参考）
+
+- **`english.py` 的 4 处 `open()` 没指定 encoding** → 中文 Windows 下按 GBK 读
+  UTF-8 的 `cmudict.rep` 直接 `UnicodeDecodeError`。已在 vendor 里补 `encoding="utf-8"`。
+- **`word2ph` 对非中文语言是 `None`**（上游契约），BERT 特征对非中文段应给**全零** ——
+  照搬中文逻辑会 `'NoneType' object is not iterable`。
+- **`text_bert` 的 ONNX 契约是 `[T, 1024]`**，而上游 torch 内部是 `[1024, T]`（导出时转置）。
+  按上游布局写会报 `Got invalid dimensions for input`。
+- **`LangSegmenter` 硬编码指向 125 MB 的 `lid.176.bin`**，目录不存在时还会**联网下载**。
+  实测 lite（916 KB，随 pip 包）与 full 的分段结果**逐条一致**，故改用 lite；
+  需要 full 时设 `ZFH_LANGDETECT_MODEL=<lid.176.bin 路径>`。
 
 ---
 

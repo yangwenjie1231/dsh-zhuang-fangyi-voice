@@ -38,7 +38,8 @@ def _build_tts(args):
     return TTS(backend=args.backend, model_dir=args.model_dir,
                ref_wav=args.ref, ref_text=args.ref_text,
                use_cache=not args.no_cache,
-               localize=not getattr(args, "no_localize", False), **kw)
+               localize=(args.localize if args.localize is not None else "auto"),
+               **kw)
 
 
 # CUDA / DirectML 下每次冷启动都要重付"加载 + 预热"的代价
@@ -221,9 +222,14 @@ def main(argv=None):
     ap.add_argument("--ref-text", default=None, help="参考音频对应文本")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--no-cache", action="store_true", help="禁用合成缓存")
-    ap.add_argument("--no-localize", action="store_true",
-                    help="不把英文转成中文读法（默认转换；"
-                         "不转换时英文会被文本前端静默删除）")
+    ap.add_argument("--localize", dest="localize", action="store_true",
+                    default=None,
+                    help="把英文转成中文读法再合成（GPU→基皮尤）。"
+                         "默认 auto：中英混排可用时用真英文发音，"
+                         "不可用时自动转中文读法兜底")
+    ap.add_argument("--no-localize", dest="localize", action="store_false",
+                    help="总是不转（英文交给 LangSegmenter 分段，"
+                         "用真英文音素念）")
     ap.add_argument("--gsv-root", default=None,
                     help="GPT-SoVITS 检出目录（torch 后端需要）")
     ap.add_argument("--device", default=None, help="torch 后端设备: cuda/cpu")
