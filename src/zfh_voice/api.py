@@ -55,9 +55,12 @@ class SynthResult:
 class TTS:
     def __init__(self, backend="onnx", model_dir=None, cache_dir=None,
                  ref_wav=None, ref_text=None, use_cache=True, **backend_kw):
-        self.model_dir = paths.resolve_model_dir(model_dir)
-        self.use_cache = use_cache
         self._backend_kind = backend
+        # 按后端分别校验：onnx 后端必须有 7 个 ONNX；
+        # torch 后端只认 .ckpt/.pth，**不要求 ONNX 存在**（两者互不通用）
+        require = "onnx" if backend == "onnx" else None
+        self.model_dir = paths.resolve_model_dir(model_dir, require=require)
+        self.use_cache = use_cache
         self._backend_kw = backend_kw
         self._backend = None
 
@@ -65,9 +68,18 @@ class TTS:
         self.ref_wav = ref_wav or self._default_ref()
         self.ref_text = ref_text or self._default_ref_text()
         if not self.ref_wav or not os.path.exists(self.ref_wav):
+            extra = ""
+            if backend != "onnx":
+                extra = ("\n（torch 后端同样需要参考音频；"
+                         "它来自 zfh-voice-aux.zip，不随 torch 权重一起下载）")
             raise FileNotFoundError(
-                "找不到默认参考音频。请用 ref_wav= 指定，"
-                f"或确认模型目录下有 {DEFAULT_REF_NAME}")
+                f"找不到默认参考音频（期望路径："
+                f"{os.path.join(self.model_dir, DEFAULT_REF_NAME)}）。\n"
+                f"两种解决方式：\n"
+                f"  1) 用 ref_wav= 与 ref_text= 指定自己的参考音频\n"
+                f"     （3~10 秒目标音色干声，文本需逐字对应）\n"
+                f"  2) 下载辅助包：python download_models.py --with-torch\n"
+                f"     （辅助包含 G2PW 数据、tokenizer 与默认参考音频）" + extra)
 
         self.cache_dir = cache_dir or os.path.join(
             os.path.dirname(self.model_dir), "cache")

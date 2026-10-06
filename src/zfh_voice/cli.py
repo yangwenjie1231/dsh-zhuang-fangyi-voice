@@ -63,15 +63,25 @@ def cmd_serve(args):
 
 
 def cmd_status(args):
-    from .paths import model_status, repo_root
-    d, missing, ok = model_status(args.model_dir)
+    from .paths import has_onnx, has_torch_weights, model_status, repo_root
+    d, missing, ok = model_status(args.model_dir, backend=args.backend)
     print(f"仓库根目录 : {repo_root()}")
     print(f"模型目录   : {d}")
+    print(f"后端       : {args.backend}")
     print(f"状态       : {'✓ 就绪' if ok else f'✗ 缺 {len(missing)} 个文件'}")
+    # 顺带告知另一类模型是否也在，便于判断能否切换后端
+    print(f"  另有 ONNX 模型      : {'是' if has_onnx(d) else '否'}")
+    print(f"  另有 torch 权重     : {'是' if has_torch_weights(d) else '否'}")
     if missing:
-        for m in missing:
+        for m in missing[:12]:
             print(f"  缺: {m}")
-        print("\n运行 `python download_models.py` 下载模型")
+        if len(missing) > 12:
+            print(f"  ... 共 {len(missing)} 项")
+        if args.backend == "onnx":
+            print("\n运行 `python download_models.py` 下载 ONNX 模型")
+        else:
+            print("\n运行 `python download_models.py --with-torch` 下载 torch 权重")
+            print("（torch 后端不要求 ONNX 模型；两者互不通用）")
     return 0 if ok else 1
 
 

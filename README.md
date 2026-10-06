@@ -59,7 +59,9 @@ python -m zfh_voice say "今天天气不错，我们一起出去走走吧。"
 > （共约 229 MB），要单独下载：
 >
 > ```bash
-> python download_models.py --with-torch    # 下载到 models/torch_weights/
+> python download_models.py --torch-only   # 只下 torch 所需，跳过 1.4GB 的 ONNX
+> # 或已下过 ONNX、想补 torch：
+> python download_models.py --with-torch
 > ```
 
 ```bash

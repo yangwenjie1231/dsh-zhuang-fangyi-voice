@@ -138,7 +138,12 @@ def main():
     ap.add_argument("--with-torch", action="store_true",
                     help="额外下载 torch 后端所需的 .ckpt/.pth（约 229MB，"
                          "ONNX 后端用不到）")
+    ap.add_argument("--torch-only", action="store_true",
+                    help="只下 torch 后端所需（辅助包 + .ckpt/.pth），"
+                         "完全跳过 ONNX（省 1.4GB）")
     a = ap.parse_args()
+    if a.torch_only:
+        a.with_torch = True
 
     order = (a.source,) if a.source else DEFAULT_ORDER
     d = target_dir(a.dir)
@@ -157,14 +162,24 @@ def main():
                                                      os.path.basename(v)))]
 
     if a.check:
-        print(f"\nONNX  : {len(ONNX_FILES) - len(need)}/{len(ONNX_FILES)} 就绪")
+        mode = "torch-only" if a.torch_only else a.precision
+        print(f"\n模式  : {mode}")
+        if not a.torch_only:
+            print(f"ONNX  : {len(ONNX_FILES) - len(need)}/{len(ONNX_FILES)} 就绪")
         print(f"辅助  : {'就绪' if aux_ok else '缺失'}")
         print(f"参考音: {'就绪' if ref_ok else '缺失'}")
         print(f"torch : {len(TORCH_ASSETS) - len(torch_need)}/{len(TORCH_ASSETS)} 就绪"
-              + ("" if a.with_torch else "（未请求，加 --with-torch 才会下载）"))
-        if need:
-            print("缺失: " + ", ".join(need))
-        return 0 if (not need and aux_ok and ref_ok) else 1
+              + ("" if a.with_torch else "（未请求）"))
+        if not a.torch_only and need:
+            print("缺失 ONNX: " + ", ".join(need))
+        if a.with_torch and torch_need:
+            print("缺失 torch: " + ", ".join(torch_need))
+        ready = aux_ok and ref_ok
+        if not a.torch_only:
+            ready = ready and not need
+        if a.with_torch:
+            ready = ready and not torch_need
+        return 0 if ready else 1
 
     os.makedirs(d, exist_ok=True)
     ok = True
@@ -182,8 +197,10 @@ def main():
     else:
         print("\n辅助文件已就绪")
 
-    # 2) ONNX 模型
-    if need:
+    # 2) ONNX 模型（--torch-only 时跳过）
+    if a.torch_only:
+        print("\n--torch-only：跳过 ONNX 模型")
+    elif need:
         print(f"\n需下载 {len(need)} 个模型（{a.precision}）")
         for f in need:
             tmp = os.path.join(d, f + ".part")
@@ -225,16 +242,17 @@ def main():
         if not torch_need:
             print("  已全部就绪")
 
-    # 5) 校验
+    # 5) 校验（按所选模式，只校验实际需要的东西）
     print("\n=== 校验 ===")
     missing = []
-    for f in ONNX_FILES:
-        p = os.path.join(d, f)
-        if os.path.exists(p):
-            print(f"  OK   {f:<28}{os.path.getsize(p)/1024/1024:>8.1f} MB")
-        else:
-            print(f"  MISS {f}")
-            missing.append(f)
+    if not a.torch_only:
+        for f in ONNX_FILES:
+            p = os.path.join(d, f)
+            if os.path.exists(p):
+                print(f"  OK   {f:<28}{os.path.getsize(p)/1024/1024:>8.1f} MB")
+            else:
+                print(f"  MISS {f}")
+                missing.append(f)
     if a.with_torch:
         for asset, rel in TORCH_ASSETS.items():
             p = os.path.join(torch_dir, os.path.basename(rel))
@@ -244,19 +262,32 @@ def main():
             else:
                 print(f"  MISS torch/{os.path.basename(rel)}")
                 missing.append(os.path.basename(rel))
+    # 辅助文件（两种后端都需要：文本前端 + 默认参考音频）
+    for f in ("G2PWModel/g2pW.onnx",
+              "chinese-roberta-wwm-ext-large/tokenizer.json",
+              "ref/default.wav"):
+        p = os.path.join(d, f.replace("/", os.sep))
+        if os.path.exists(p):
+            print(f"  OK   {f}")
+        else:
+            print(f"  MISS {f}")
+            missing.append(f)
 
     if missing:
         print(f"\n仍缺 {len(missing)} 个文件")
         ok = False
     else:
-        print("\n全部就绪。可以用了：")
-        print('  python -m zfh_voice say "今天天气不错"')
-        if a.with_torch:
-            print("\ntorch 权重已下到 torch_weights/，用 --backend torch 时指定路径：")
-            for asset, rel in TORCH_ASSETS.items():
-                flag = "--gsv-root 或 gpt_path/sovits_path"
-                print(f"  {os.path.join(torch_dir, os.path.basename(rel))}")
-            print(f"  （{flag}）")
+        if a.torch_only:
+            print("\ntorch 模式就绪。使用方式：")
+            print("  python -m zfh_voice --backend torch \\")
+            print("      --gsv-root <GPT-SoVITS 检出目录> say \"今天天气不错\"")
+            print(f"\n权重位于 {torch_dir}\\，torch 后端会自动在此查找。")
+        else:
+            print("\n全部就绪。可以用了：")
+            print('  python -m zfh_voice say "今天天气不错"')
+            if a.with_torch:
+                print("\ntorch 权重已下到 torch_weights/，torch 后端会自动查找；")
+                print("也可用 --backend torch --gsv-root <目录> 手动指定。")
     return 0 if ok else 1
 
 
