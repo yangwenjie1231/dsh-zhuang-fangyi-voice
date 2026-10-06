@@ -13,5 +13,11 @@
         # 全部留空 = 自动：后端用子插件默认，python 从 PATH / .venv 找，
         # 仓库目录就是本插件自己的目录（插件知道自己装在哪，不需要绝对路径）。
         backend: auto
+        # 常驻策略（桌宠设置页会实时改它，不必改这里）：
+        #   resident=false   空闲后释放显存
+        #   idleStopSec=300  空闲 5 分钟后触发
+        #   idleAction=stop  释放方式：stop=杀进程（全释放、恢复慢）
+        #                    unload=只卸模型、留进程（显存同样释放、恢复快）
         resident: false
         idleStopSec: 300
+        idleAction: stop

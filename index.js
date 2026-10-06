@@ -41,6 +41,7 @@
  */
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -54,6 +55,22 @@ export const SERVICE_NAME = 'zfhVoice'
 
 /** 空闲多久停掉服务释放显存（秒）—— 默认 5 分钟。 */
 export const DEFAULT_IDLE_STOP_SEC = 300
+
+/**
+ * 空闲时怎么释放 —— 两档，默认 `stop`（保持既有行为）：
+ *
+ *   · `stop`   杀掉服务进程：显存全释放，恢复最慢（进程启动+导入+加载+预热）。
+ *   · `unload` 只卸模型、保留进程：**显存同样释放**，恢复更快（省掉启动与导入）。
+ *
+ * 之所以做成开关而不是常量：省显存与快恢复是一对矛盾，不同机器答案不同。
+ */
+export const DEFAULT_IDLE_ACTION = 'stop'
+
+/** 合法取值（配置校验用白名单）。 */
+export const IDLE_ACTIONS = ['stop', 'unload']
+
+/** 跑 `doctor` 体检的超时（首次导入可能慢，给足时间但不无限等）。 */
+export const DOCTOR_TIMEOUT_MS = 30000
 
 /** 启动后等健康检查的最长时间（CUDA 下加载模型可能几十秒）。 */
 export const DEFAULT_START_TIMEOUT_MS = 120000
@@ -150,6 +167,188 @@ export function buildServeCommand (o = {}) {
 }
 
 /**
+ * **纯函数**：由 `serve` 的启动信息推出对应的 `doctor --json` 命令。
+ *
+ * 复用同一个 python 与同一批全局参数，保证"体检的就是要跑的那套环境"。
+ *
+ * @param {object} o
+ * @param {{argv: string[], cwd: string, env: object}|null} o.launch
+ * @param {string} o.jsonPath
+ * @returns {{argv: string[], cwd: string, env: object}|null}
+ */
+export function buildDoctorCommand (o = {}) {
+  const base = o.launch
+  const jsonPath = String(o.jsonPath ?? '').trim()
+  if (base === null || base === undefined) return null
+  if (!Array.isArray(base.argv) || base.argv.length === 0) return null
+  if (jsonPath === '') return null
+  const python = base.argv[0]
+  const at = base.argv.indexOf('serve')
+  // ⚠️ serve 的 argv 形状是 [python, '-m', 'zfh_voice', ...全局参数, 'serve', ...]，
+  // 要复用的**只有全局参数** —— 必须跳过 `-m zfh_voice`，否则会拼出
+  //   python -m zfh_voice -m zfh_voice --backend ... doctor
+  // 这种命令（Python 直接报错退出，JSON 永远不生成）。
+  let start = 1
+  const iM = base.argv.indexOf('-m')
+  if (iM >= 0 && base.argv[iM + 1] === 'zfh_voice') start = iM + 2
+  const globals = (at > start) ? base.argv.slice(start, at) : []
+  return {
+    argv: [python, '-m', 'zfh_voice', ...globals, 'doctor', '--json', jsonPath],
+    cwd: base.cwd,
+    env: base.env
+  }
+}
+
+/**
+ * **纯函数**：把 doctor 的体检结果翻译成"到底是什么问题 + 该敲什么命令"。
+ *
+ * 分类只在**有把握**时下结论；拿不准一律 `unknown` 并透传原文 ——
+ * 宁可说"我不知道"，也不能因为解析失败就谎称"没问题"。
+ *
+ * @param {object|null} report - doctor --json 的结果
+ * @param {string} [fallback] - 没有报告时的兜底描述
+ * @returns {{kind: string, summary: string, commands: string[]}}
+ */
+export function classifyFailure (report, fallback = '服务起不来，原因未知') {
+  if (report === null || report === undefined || typeof report !== 'object') {
+    return { kind: 'unknown', summary: fallback, commands: [] }
+  }
+  const deps = Array.isArray(report.deps_missing) ? report.deps_missing : []
+  const inst = report.installed ?? {}
+
+  if (deps.length > 0) {
+    return {
+      kind: 'missing-deps',
+      summary: `缺 Python 依赖：${deps.join(', ')}`,
+      commands: ['pip install -r requirements.txt']
+    }
+  }
+  if (inst.onnx_ok !== true && inst.torch_ok !== true) {
+    return {
+      kind: 'missing-models',
+      summary: 'Python 依赖齐了，但模型还没下载',
+      commands: [
+        'python download_models.py            # ONNX（默认 fp16，约 1.4GB）',
+        'python download_models.py --with-torch   # 需要 torch 后端时'
+      ]
+    }
+  }
+  if (inst.aux_ok !== true || inst.ref_ok !== true) {
+    return {
+      kind: 'missing-aux',
+      summary: '模型在，但文本前端辅助文件或默认参考音频缺失',
+      commands: ['python download_models.py   # 重新补齐辅助包（约 1MB）']
+    }
+  }
+  return { kind: 'unknown', summary: fallback, commands: [] }
+}
+
+/**
+ * **纯函数**：把体检结果整理成一段给人/给 agent 看的多行指引。
+ *
+ * @param {object} probe - createEnvProbe() 的返回值
+ * @param {string} [docPath] - 详细文档路径
+ * @returns {string}
+ */
+export function formatSetupGuidance (probe, docPath = 'docs/安装提示词.md') {
+  const lines = []
+  if (probe === null || probe.ran !== true || probe.ok !== true) {
+    lines.push('庄方宜语音：环境还没配好（自动体检没拿到结果）。')
+    lines.push(`  先手动跑一次：python -m zfh_voice doctor`)
+    if (probe?.error) lines.push(`  （体检失败原因：${probe.error}）`)
+    lines.push(`  详细步骤见 ${docPath}`)
+    return lines.join('\n')
+  }
+  const cls = classifyFailure(probe.report)
+  lines.push(`庄方宜语音：环境还没配好 —— ${cls.summary}`)
+  if (cls.commands.length > 0) {
+    lines.push('  在仓库目录执行：')
+    for (const c of cls.commands) lines.push(`    ${c}`)
+  } else {
+    lines.push('  先跑体检看细节：python -m zfh_voice doctor')
+  }
+  const rep = probe.report
+  if (rep?.gpu?.present === true) {
+    lines.push(`  检测到 GPU：${rep.gpu.name ?? 'NVIDIA'}`
+      + (rep.gpu.vram_mb ? `（${rep.gpu.vram_mb} MB）` : ''))
+  }
+  lines.push(`  完整步骤见 ${docPath}`)
+  return lines.join('\n')
+}
+
+/**
+ * 建环境探测器：跑 `doctor --json` 并读回结果。
+ *
+ * **为什么不收 stdout**：宿主 `ctx.subprocess` 的 stdio 契约未必保证能捕获输出，
+ * 所以让 Python 侧把结果写成文件，这里读文件 —— 对宿主实现零假设。
+ * 判完成也用"文件出现"而不是 handle.done（done 未必是 promise）。
+ *
+ * @param {object} o
+ * @param {(spec: object) => object} [o.spawn]
+ * @param {(p: string) => string} [o.readFile]
+ * @param {(p: string) => void} [o.removeFile]
+ * @param {(p: string) => string} [o.tmpFile] - 生成一个不冲突的临时文件路径
+ * @param {(ms: number) => Promise<void>} [o.sleep]
+ * @param {() => number} [o.now]
+ * @param {number} [o.timeoutMs]
+ */
+export function createEnvProbe (o = {}) {
+  const spawn = typeof o.spawn === 'function' ? o.spawn : null
+  const readFile = typeof o.readFile === 'function' ? o.readFile : null
+  const removeFile = typeof o.removeFile === 'function' ? o.removeFile : () => {}
+  const tmpFile = typeof o.tmpFile === 'function' ? o.tmpFile : null
+  const sleep = typeof o.sleep === 'function'
+    ? o.sleep
+    : ms => new Promise(r => setTimeout(r, ms))
+  const now = typeof o.now === 'function' ? o.now : () => Date.now()
+  const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : DOCTOR_TIMEOUT_MS
+
+  /**
+   * @param {object|null} launch - serve 的启动信息（用来推 doctor 命令）
+   * @returns {Promise<{ran: boolean, ok: boolean|null, report: object|null,
+   *                    error?: string, raw?: string}>}
+   */
+  return async function probeEnvironment (launch) {
+    const unavailable = { ran: false, ok: null, report: null }
+    if (spawn === null || readFile === null || tmpFile === null) {
+      return { ...unavailable, error: 'no-io' }
+    }
+    const jsonPath = tmpFile()
+    const cmd = buildDoctorCommand({ launch, jsonPath })
+    if (cmd === null) return { ...unavailable, error: 'no-launch' }
+
+    let handle = null
+    try {
+      handle = spawn({ ...cmd, stdio: 'ignore', graceMs: 2000 })
+    } catch (error) {
+      return { ...unavailable, error: `spawn-failed: ${error?.message ?? error}` }
+    }
+
+    const deadline = now() + timeoutMs
+    let lastRaw = ''
+    while (now() < deadline) {
+      await sleep(300)
+      try {
+        const raw = readFile(jsonPath)
+        if (typeof raw === 'string' && raw.trim().length > 2) {
+          lastRaw = raw
+          const report = JSON.parse(raw)
+          removeFile(jsonPath)
+          return { ran: true, ok: true, report }
+        }
+      } catch { /* 还没写出来，继续等 */ }
+    }
+    // 超时：别把进程留着
+    try { handle?.terminate?.() } catch { /* 已经退了 */ }
+    return {
+      ...unavailable,
+      error: lastRaw === '' ? 'timeout-no-report' : 'timeout-bad-json',
+      raw: lastRaw || undefined
+    }
+  }
+}
+
+/**
  * **纯决策**：这一刻该对服务做什么。
  *
  * 穷举"常驻/非常驻 × 健康/不健康 × 谁起的 × 空闲多久"——这些组合在真实
@@ -165,6 +364,10 @@ export function nextServiceAction (s) {
   const launchable = s.launchable === true
   const idleMs = Number.isFinite(s.idleMs) ? s.idleMs : 0
   const idleLimitMs = Number.isFinite(s.idleLimitMs) ? s.idleLimitMs : 0
+  // 空闲怎么释放：stop（杀进程）或 unload（只卸模型、留进程）
+  const idleAction = IDLE_ACTIONS.includes(s.idleAction)
+    ? s.idleAction
+    : DEFAULT_IDLE_ACTION
 
   // ① 不是我们起的 → 永不碰它（用户自己开的服务）。
   if (!ours) return { action: 'none', why: 'not-ours' }
@@ -177,9 +380,11 @@ export function nextServiceAction (s) {
     return { action: 'restart', why: 'down-resident' }
   }
 
-  // ③ 健康 + 我们起的：常驻留着；非常驻空闲够了就停。
+  // ③ 健康 + 我们起的：常驻留着；非常驻空闲够了就释放。
   if (resident) return { action: 'none', why: 'resident-keep' }
-  if (idleLimitMs > 0 && idleMs >= idleLimitMs) return { action: 'stop', why: 'idle-stop' }
+  if (idleLimitMs > 0 && idleMs >= idleLimitMs) {
+    return { action: idleAction, why: `idle-${idleAction}` }
+  }
   return { action: 'none', why: 'in-use' }
 }
 
@@ -231,6 +436,11 @@ export function defaultConfig () {
     resident: false,
     /** 非常驻时，空闲多少秒停掉（0 = 不停）。 */
     idleStopSec: DEFAULT_IDLE_STOP_SEC,
+    /**
+     * 空闲时怎么释放：`stop`（杀进程，全释放、恢复慢）
+     * 或 `unload`（只卸模型、留进程，**显存同样释放**、恢复快）。
+     */
+    idleAction: DEFAULT_IDLE_ACTION,
     /** 等模型加载的上限。 */
     startTimeoutMs: DEFAULT_START_TIMEOUT_MS
   }
@@ -252,6 +462,7 @@ export function normalizeConfig (input, base = defaultConfig()) {
   const port = Number(input.port)
   if (Number.isFinite(port) && port > 0 && port < 65536) out.port = Math.floor(port)
   if (typeof input.resident === 'boolean') out.resident = input.resident
+  if (IDLE_ACTIONS.includes(input.idleAction)) out.idleAction = input.idleAction
   const idle = Number(input.idleStopSec)
   if (Number.isFinite(idle) && idle >= 0 && idle <= 86400) out.idleStopSec = Math.floor(idle)
   const timeout = Number(input.startTimeoutMs)
@@ -264,6 +475,12 @@ export function normalizeConfig (input, base = defaultConfig()) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 运行时（HTTP 客户端 + 进程监管）
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** 数字或 null（区分"0"与"没有这个字段"）。 */
+function numOrNull (v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 
 /** 建 TTS HTTP 客户端（只依赖 Python 侧已文档化的契约）。 */
 function createClient (cfg, logger) {
@@ -289,8 +506,21 @@ function createClient (cfg, logger) {
       return {
         ok: true,
         backend: typeof body.backend === 'string' ? body.backend : null,
-        version: typeof body.version === 'string' ? body.version : null
+        version: typeof body.version === 'string' ? body.version : null,
+        // ★ 模型真实是否加载在内存/显存里 —— 注意这**不等于**配置里的
+        //   `resident`（那是"策略意图"）。两者必须分开上报，否则
+        //   "配了常驻但还没加载完"会被误报成"已在显存里"。
+        //   旧版 Python 侧没有这些字段 → 落到 null，表示"未知"。
+        resident: typeof body.resident === 'boolean' ? body.resident : null,
+        idleSeconds: numOrNull(body.idle_seconds),
+        loads: numOrNull(body.loads),
+        unloads: numOrNull(body.unloads)
       }
+    },
+    /** 让服务释放模型（保留进程）—— 显存释放，恢复比重启进程快 */
+    async unload () {
+      const body = await json(`${baseUrl}/unload`, { method: 'POST' }, 10000)
+      return body?.ok === true ? body.unloaded !== false : false
     },
     async synthesize (text) {
       if (fetchImpl === null) return null
@@ -331,6 +561,10 @@ function createClient (cfg, logger) {
 export function createSupervisor (o = {}) {
   const spawn = typeof o.spawn === 'function' ? o.spawn : null
   const health = typeof o.health === 'function' ? o.health : async () => null
+  // 让服务"只卸模型、保留进程"的接缝（与 health 同样是注入的，便于测试）
+  const unloadRemote = typeof o.unload === 'function' ? o.unload : async () => false
+  // 起不来时做一次环境体检，把"缺什么"问出来（失败路径才调用，慢一点无妨）
+  const diagnose = typeof o.diagnose === 'function' ? o.diagnose : async () => null
   const logger = o.logger ?? null
   const now = typeof o.now === 'function' ? o.now : () => Date.now()
 
@@ -341,19 +575,47 @@ export function createSupervisor (o = {}) {
   let exitedAt = 0
   let lastUseAt = now()
   let lastError = null
+  /** 结构化的失败原因（{kind, summary, commands}），供 UI/agent 直接消费 */
+  let lastFailure = null
   let backend = null
   let starting = null
+  /** 最近一次成功的 /health 快照 —— `status()` 用它回答"模型到底在不在"。 */
+  let lastHealth = null
 
   let _spawnCount = 0
+  let _unloadCount = 0
 
   const launchable = () => launch !== null && spawn !== null
+
+  /**
+   * 起不来的**兜底说明**：跑一次体检，把"缺依赖 / 缺模型"分清楚。
+   * 探测本身失败不影响主流程 —— 只把已知信息记下来。
+   */
+  const enrichFailure = async (reason) => {
+    let probe = null
+    try { probe = await diagnose() } catch { probe = null }
+    const cls = (probe !== null && probe.ran === true && probe.ok === true)
+      ? classifyFailure(probe.report, reason)
+      : { kind: 'unknown', summary: reason, commands: ['python -m zfh_voice doctor'] }
+    if (cls.kind === 'unknown' && probe?.ran !== true) {
+      cls.commands = ['python -m zfh_voice doctor   # 先看环境缺什么']
+    }
+    lastFailure = cls
+    lastError = cls.summary + (cls.commands.length > 0 ? ` —— 修复：${cls.commands[0]}` : '')
+    logger?.warn?.(probe !== null
+      ? formatSetupGuidance(probe)
+      : `庄方宜语音：${cls.summary}\n  先跑：python -m zfh_voice doctor`)
+    return cls
+  }
 
   const probe = async () => {
     const h = await health()
     if (h !== null && h !== undefined && h.ok === true) {
       backend = h.backend ?? backend
+      lastHealth = h
       return true
     }
+    lastHealth = null
     return false
   }
 
@@ -376,14 +638,17 @@ export function createSupervisor (o = {}) {
         startedAt = now()
         exitedAt = 0
         lastError = null
+        lastFailure = null
         try {
           handle?.done?.then(value => {
             exitedAt = now()
             const ms = startedAt > 0 ? exitedAt - startedAt : 0
             if (ms < RAPID_EXIT_MS) {
-              lastError = `服务启动后 ${Math.round(ms / 1000)} 秒就退出（exit=${value?.exitCode ?? '?'}）` +
-                ' —— 多半是依赖没装或模型没下载，见 docs/安装提示词.md'
-              logger?.warn?.(`庄方宜语音：${lastError}`)
+              const reason = `服务启动后 ${Math.round(ms / 1000)} 秒就退出` +
+                `（exit=${value?.exitCode ?? '?'}）`
+              // 起不来才做体检：把"缺依赖 / 缺模型"分清楚再报给用户。
+              // 异步做，不阻塞本次 ensure 的返回。
+              void enrichFailure(reason).catch(() => {})
             }
             handle = null
           }).catch(() => {})
@@ -398,11 +663,26 @@ export function createSupervisor (o = {}) {
           if (handle === null && exitedAt > 0) return false
           await new Promise(r => setTimeout(r, 1000))
         }
-        lastError = `等 ${Math.round(cfg.startTimeoutMs / 1000)} 秒仍未就绪（模型可能太大）`
+        lastFailure = { kind: 'timeout', summary: `等 ${Math.round(cfg.startTimeoutMs / 1000)} 秒仍未就绪`, commands: ['把配置 startTimeoutMs 调大（CUDA 首次加载较慢）'] }
+        lastError = lastFailure.summary
+        logger?.warn?.(`庄方宜语音：${lastError} —— ${lastFailure.commands[0]}`)
         return false
       } catch (error) {
-        lastError = String(error?.message ?? error)
-        logger?.warn?.(`庄方宜语音：启动服务失败：${lastError}`)
+        const msg = String(error?.message ?? error)
+        // spawn 直接抛（而不是"起来了又秒退"）最常见的原因就是解释器不存在
+        if (/ENOENT|not found|no such file|不是内部或外部命令/i.test(msg)) {
+          lastFailure = {
+            kind: 'no-python',
+            summary: `找不到 python 解释器：${launch?.argv?.[0] ?? 'python'}`,
+            commands: ['装 Python 3.9+，或设置环境变量 ZFH_VOICE_PYTHON 指向解释器',
+                       '或在插件配置里填 python']
+          }
+        } else {
+          lastFailure = { kind: 'spawn-failed', summary: msg, commands: [] }
+        }
+        lastError = lastFailure.summary
+        logger?.warn?.(`庄方宜语音：启动服务失败：${lastError}`
+          + (lastFailure.commands[0] ? `\n  ${lastFailure.commands[0]}` : ''))
         return false
       } finally {
         starting = null
@@ -425,10 +705,34 @@ export function createSupervisor (o = {}) {
     }
   }
 
+  /**
+   * 只卸模型、**保留进程** —— 显存同样释放，但下次合成省掉
+   * "进程启动 + Python 导入"这段开销（CUDA 下这段并不便宜）。
+   *
+   * 关键：进程还在，所以 `handle` 不动 —— `ours` 账本必须继续认它，
+   * 否则下一次 tick 会判成"不是我们起的"而不再管理。
+   */
+  const unloadModel = async () => {
+    if (handle === null) return false
+    if (lastHealth !== null && lastHealth.resident === false) return false // 已经释放过
+    try {
+      const ok = await unloadRemote()
+      if (ok) {
+        _unloadCount += 1
+        logger?.info?.('庄方宜语音：已释放模型（进程保留，显存已回收）')
+      }
+      return ok
+    } catch (error) {
+      logger?.warn?.(`庄方宜语音：释放模型失败：${error?.message ?? error}`)
+      return false
+    }
+  }
+
   const tick = async () => {
     const healthy = await probe().catch(() => false)
     const decision = nextServiceAction({
       resident: cfg.resident,
+      idleAction: cfg.idleAction,
       ours: handle !== null || (exitedAt > 0 && startedAt > 0),
       healthy,
       idleMs: now() - lastUseAt,
@@ -437,6 +741,7 @@ export function createSupervisor (o = {}) {
       rapidExit: lastError !== null && lastError.includes('就退出')
     })
     if (decision.action === 'stop') stop()
+    else if (decision.action === 'unload') await unloadModel()
     else if (decision.action === 'restart') await ensure()
     return decision
   }
@@ -452,17 +757,34 @@ export function createSupervisor (o = {}) {
     markUse: () => { lastUseAt = now() },
     status () {
       return {
-        resident: cfg.resident,
+        // ── 常驻三态：意图 / 进程 / 模型 ──
+        // 三者必须分开，否则"配了常驻但模型还没加载完"会被误报成已在显存里。
+        resident: cfg.resident,                 // 策略意图（配置里写的）
+        processAlive: handle !== null,          // 服务进程在不在
+        ready: handle !== null,                 // 兼容旧名（= processAlive）
+        // 契约：`boolean | null`。老版本 Python 侧没有 `resident` 字段时
+        // 必须落到 null（未知），**绝不能**降级成 false（"没加载"）——
+        // 前者是"不知道"，后者是错误结论。
+        modelLoaded: (lastHealth === null || typeof lastHealth.resident !== 'boolean')
+          ? null
+          : lastHealth.resident,
+        idleSeconds: lastHealth?.idleSeconds ?? null,
+        loads: lastHealth?.loads ?? null,
+        unloads: lastHealth?.unloads ?? null,
+        idleAction: cfg.idleAction,
+
         launchable: launchable(),
         ours: handle !== null,
         pid: handle?.pid ?? null,
-        ready: handle !== null,
         backend,
         lastError,
+        /** 结构化失败原因：{kind, summary, commands} —— UI/agent 可直接消费 */
+        lastFailure,
         idleMs: now() - lastUseAt,
         idleStopSec: cfg.idleStopSec,
         launch: launch === null ? null : { argv: launch.argv, cwd: launch.cwd },
-        spawnCount: _spawnCount
+        spawnCount: _spawnCount,
+        unloadCount: _unloadCount
       }
     }
   }
@@ -499,18 +821,34 @@ export function apply (ctx, rawConfig) {
   })
 
   const client = createClient(cfg, logger)
+
+  /** 宿主子进程接缝（doctor 与 serve 共用同一份） */
+  const subprocessSpawn = spec => {
+    let sub = null
+    try {
+      sub = typeof ctx.get === 'function' ? ctx.get('subprocess') : undefined
+    } catch { sub = null }
+    if (sub === null || sub === undefined || typeof sub.spawn !== 'function') {
+      throw new Error('宿主未提供 ctx.subprocess，无法托管推理服务进程')
+    }
+    return sub.spawn(spec)
+  }
+
+  // 环境体检器：让 doctor 把结果写成 JSON，这里读回来（对宿主 stdio 零假设）
+  const envProbe = createEnvProbe({
+    spawn: spec => { try { return subprocessSpawn(spec) } catch { return null } },
+    readFile: p => fs.readFileSync(p, 'utf8'),
+    removeFile: p => { try { fs.rmSync(p, { force: true }) } catch { /* 无所谓 */ } },
+    tmpFile: () => path.join(
+      os.tmpdir(), `zfh-doctor-${process.pid}-${Date.now()}.json`)
+  })
+  const runDoctor = () => envProbe(supervisor.status().launch)
+
   const supervisor = createSupervisor({
-    spawn: spec => {
-      let sub = null
-      try {
-        sub = typeof ctx.get === 'function' ? ctx.get('subprocess') : undefined
-      } catch { sub = null }
-      if (sub === null || sub === undefined || typeof sub.spawn !== 'function') {
-        throw new Error('宿主未提供 ctx.subprocess，无法托管推理服务进程')
-      }
-      return sub.spawn(spec)
-    },
+    spawn: subprocessSpawn,
     health: () => client.health(),
+    unload: () => client.unload(),
+    diagnose: runDoctor,
     logger
   })
   supervisor.setConfig(cfg, launch)
@@ -524,6 +862,28 @@ export function apply (ctx, rawConfig) {
       try { supervisor.stop() } catch { /* 已退出 */ }
     }
   }, 'zhuang-fangyi-voice: service supervisor')
+
+  // 挂载后异步探一次环境。**不阻塞挂载**（挂载成功 ≠ 环境就绪，
+  // 但环境没配好时用户必须立刻看到"缺什么、敲什么"，而不是等到点"试一句"才发现哑了）。
+  ctx.effect(() => {
+    let alive = true
+    const run = async () => {
+      const probe = await runDoctor().catch(() => null)
+      if (!alive || probe === null) return
+      if (probe.ran === true && probe.ok === true) {
+        const cls = classifyFailure(probe.report)
+        if (cls.kind === 'unknown') return          // 环境没问题 → 不打扰
+        logger?.warn?.(formatSetupGuidance(probe))
+        return
+      }
+      logger?.warn?.(
+        `庄方宜语音：环境体检没跑完（${probe.error ?? '未知原因'}）。\n` +
+        '  手动跑一次：python -m zfh_voice doctor\n' +
+        '  安装步骤见 docs/安装提示词.md')
+    }
+    void run().catch(() => {})
+    return () => { alive = false }
+  }, 'zhuang-fangyi-voice: startup env probe')
 
   /**
    * 对外服务：其它插件用它把一句话变成语音。
@@ -542,6 +902,46 @@ export function apply (ctx, rawConfig) {
     },
     /** 健康检查（不启动服务）。 */
     health: () => client.health(),
+
+    /**
+     * 环境体检 —— 把"缺什么、该敲什么命令"以结构化形式给出来。
+     *
+     * DSH / 桌宠可以拿它当行动依据：`cls.kind` 决定怎么提示用户，
+     * `cls.commands` 就是可直接执行的修复命令。
+     * 探测失败时返回 `{ran:false}` 而不是抛（与 synthesize 的纪律一致）。
+     */
+    async diagnose () {
+      const probe = await runDoctor().catch(() => null)
+      if (probe === null) return { ran: false, ok: null, report: null, failure: null }
+      const failure = (probe.ran === true && probe.ok === true)
+        ? classifyFailure(probe.report)
+        : { kind: 'probe-failed', summary: probe.error ?? '体检未完成', commands: ['python -m zfh_voice doctor'] }
+      return {
+        ran: probe.ran === true,
+        ok: probe.ok ?? null,
+        report: probe.report ?? null,
+        failure,
+        error: probe.error ?? null,
+        guidance: formatSetupGuidance(probe)
+      }
+    },
+
+    /**
+     * 运行时切换常驻（桌宠设置页的"让语音模型常驻"开关用它）。
+     * `true` 时顺手拉起服务，不必等下一次 tick。
+     */
+    setResident (on) {
+      this.configure({ resident: on === true })
+      if (on === true) void supervisor.ensure().catch(() => {})
+      return this.status()
+    },
+
+    /** 运行时切换空闲释放档位：`stop`（杀进程）或 `unload`（只卸模型）。 */
+    setIdleAction (action) {
+      this.configure({ idleAction: action })
+      return this.status()
+    },
+
     /** 只读状态。 */
     status: () => ({
       ...supervisor.status(),

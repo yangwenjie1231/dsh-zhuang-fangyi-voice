@@ -20,8 +20,15 @@ import {
   defaultConfig,
   normalizeConfig,
   createSupervisor,
+  buildDoctorCommand,
+  classifyFailure,
+  formatSetupGuidance,
+  createEnvProbe,
   RAPID_EXIT_MS,
-  DEFAULT_IDLE_STOP_SEC
+  DEFAULT_IDLE_STOP_SEC,
+  DEFAULT_IDLE_ACTION,
+  IDLE_ACTIONS,
+  DOCTOR_TIMEOUT_MS
 } from '../index.js'
 
 let passed = 0
@@ -393,6 +400,317 @@ await okAsync('⭐ status() 里带启动命令（用户能看到到底会执行�
   assert.ok(st.launch.argv.includes('serve'), `命令里应有 serve 子命令：${st.launch.argv.join(' ')}`)
   assert.ok(st.repoDir !== undefined || st.python !== undefined, '应报出解析结果')
   for (const d of ctx.effects) if (typeof d === 'function') assert.doesNotThrow(() => d())
+})
+
+/* ── 8. 常驻三态 + 两级释放 ──────────────────────────────────────────────── */
+
+section('8. 常驻三态与两级释放')
+
+await okAsync('⭐ unload 档位：空闲时卸模型但**保留进程**，且仍算 ours', async () => {
+  const g = gated()
+  let t = 1000
+  let unloaded = 0
+  const sup = createSupervisor({
+    spawn: g.spawn,
+    health: g.health,
+    unload: async () => { unloaded += 1; return true },
+    now: () => t
+  })
+  sup.setConfig({ ...defaultConfig(), resident: false, idleStopSec: 60, idleAction: 'unload' },
+    { argv: ['p'], cwd: 'c', env: {} })
+  assert.equal(await sup.ensure(), true)
+  t += 70000
+  const d = await sup.tick()
+  assert.equal(d.action, 'unload', `空闲应卸模型而不是杀进程：${JSON.stringify(d)}`)
+  assert.equal(unloaded, 1, '应调用过 /unload')
+  assert.equal(g.st.handles.filter(h => h.terminated).length, 0, '不该杀进程')
+  // ★ 关键：进程还在 → ours 必须继续成立，否则下次 tick 会认为"不是我们起的"而撒手
+  assert.equal(sup.status().ours, true, 'unload 后仍应认这个进程')
+  assert.equal(sup.status().processAlive, true)
+  assert.equal(sup.status().unloadCount, 1)
+})
+
+await okAsync('⭐⭐ stop 档位：空闲时杀进程（保持既有行为）', async () => {
+  const g = gated()
+  let t = 1000
+  const sup = createSupervisor({ spawn: g.spawn, health: g.health, unload: async () => true, now: () => t })
+  sup.setConfig({ ...defaultConfig(), resident: false, idleStopSec: 60, idleAction: 'stop' },
+    { argv: ['p'], cwd: 'c', env: {} })
+  await sup.ensure()
+  t += 70000
+  assert.equal((await sup.tick()).action, 'stop')
+  assert.equal(g.st.handles.filter(h => h.terminated).length, 1)
+})
+
+await okAsync('⭐⭐ modelLoaded 三态：未知 / 已加载 / 已释放 —— 不误报', async () => {
+  // ① 服务没在跑 → null（未知，而不是 false）
+  const sup0 = createSupervisor({ spawn: gated().spawn, health: async () => null })
+  sup0.setConfig(defaultConfig(), { argv: ['p'], cwd: 'c', env: {} })
+  assert.equal(sup0.status().modelLoaded, null, '服务没跑时应报"未知"而不是"未加载"')
+
+  // ② 进程在、模型已加载（用 gated(): spawn 之前不健康 → 才有真实进程）
+  const g2 = gated()
+  let healthBody = { ok: true, backend: 'torch', resident: true, idleSeconds: 1, loads: 1, unloads: 0 }
+  const sup2 = createSupervisor({
+    spawn: g2.spawn,
+    health: async () => (g2.st.started ? healthBody : null)
+  })
+  sup2.setConfig({ ...defaultConfig(), resident: true }, { argv: ['p'], cwd: 'c', env: {} })
+  assert.equal(await sup2.ensure(), true)
+  assert.equal(sup2.status().modelLoaded, true, '模型已加载应报 true')
+  assert.equal(sup2.status().processAlive, true)
+
+  // ③ 进程在、但模型已释放 → false，且 processAlive 仍为 true
+  healthBody = { ok: true, backend: 'torch', resident: false, idleSeconds: 90, loads: 1, unloads: 1 }
+  assert.equal(await sup2.ensure(), true)
+  const st = sup2.status()
+  assert.equal(st.modelLoaded, false, '已释放应报 false')
+  assert.equal(st.processAlive, true, '进程仍在')
+  assert.equal(st.resident, true, '配置意图不受影响')
+  assert.equal(st.unloads, 1)
+})
+
+await okAsync('⭐ 旧的 Python 侧（/health 没有 resident）→ 报 null 而不是猜', async () => {
+  const g = gated()
+  const sup = createSupervisor({
+    spawn: g.spawn,
+    health: async () => ({ ok: true, backend: 'onnx' })   // 老版本，无 resident 字段
+  })
+  sup.setConfig(defaultConfig(), { argv: ['p'], cwd: 'c', env: {} })
+  await sup.ensure()
+  assert.equal(sup.status().modelLoaded, null, '拿不到就报未知，绝不能猜成 false')
+})
+
+ok('idleAction 默认 stop（保持既有行为，零意外）', () => {
+  assert.equal(DEFAULT_IDLE_ACTION, 'stop')
+  assert.deepEqual(IDLE_ACTIONS, ['stop', 'unload'])
+  assert.equal(defaultConfig().idleAction, 'stop')
+})
+
+ok('idleAction 非法值被过滤', () => {
+  assert.equal(normalizeConfig({ idleAction: 'unload' }).idleAction, 'unload')
+  assert.equal(normalizeConfig({ idleAction: 'nuke' }).idleAction, 'stop')
+  assert.equal(normalizeConfig({ idleAction: 42 }).idleAction, 'stop')
+})
+
+ok('nextServiceAction：resident=true 时 idleAction 不生效', () => {
+  const d = nextServiceAction({
+    resident: true, idleAction: 'unload', ours: true, healthy: true,
+    idleMs: 999999, idleLimitMs: 1000, launchable: true, rapidExit: false
+  })
+  assert.equal(d.why, 'resident-keep')
+})
+
+/* ── 9. 环境探测与失败分类（新用户路径）─────────────────────────────────── */
+
+section('9. 环境探测与失败分类')
+
+/** 造一份 doctor --json 的输出 */
+function doctorReport (over = {}) {
+  return {
+    deps_missing: [],
+    installed: { onnx_ok: true, torch_ok: false, aux_ok: true, ref_ok: true },
+    gpu: { present: true, name: 'RTX 5060', vram_mb: 8151 },
+    ...over
+  }
+}
+
+ok('⭐ classifyFailure：缺依赖', () => {
+  const c = classifyFailure(doctorReport({ deps_missing: ['numpy', 'onnxruntime'] }))
+  assert.equal(c.kind, 'missing-deps')
+  assert.ok(c.summary.includes('numpy'), `摘要应点名缺什么：${c.summary}`)
+  assert.ok(c.commands[0].includes('pip install'), '应给出可直接执行命令')
+})
+
+ok('⭐ classifyFailure：依赖齐了但没模型', () => {
+  const c = classifyFailure(doctorReport({
+    installed: { onnx_ok: false, torch_ok: false, aux_ok: true, ref_ok: true }
+  }))
+  assert.equal(c.kind, 'missing-models')
+  assert.ok(c.commands.some(x => x.includes('download_models.py')))
+})
+
+ok('⭐ classifyFailure：模型在但辅助/参考音频缺', () => {
+  const c = classifyFailure(doctorReport({
+    installed: { onnx_ok: true, torch_ok: false, aux_ok: false, ref_ok: false }
+  }))
+  assert.equal(c.kind, 'missing-aux')
+})
+
+ok('⭐ classifyFailure：全都就绪 → unknown（不谎报有问题）', () => {
+  const c = classifyFailure(doctorReport())
+  assert.equal(c.kind, 'unknown')
+})
+
+ok('⭐ classifyFailure：没有报告时透传兜底，不假装知道', () => {
+  const c = classifyFailure(null, '服务起不来')
+  assert.equal(c.kind, 'unknown')
+  assert.equal(c.summary, '服务起不来')
+  assert.deepEqual(c.commands, [])
+})
+
+ok('buildDoctorCommand：**不准重复** -m zfh_voice（曾因此拼出废命令）', () => {
+  const launch = {
+    argv: ['py', '-m', 'zfh_voice', '--backend', 'torch', '--model-dir', 'D:\\m',
+      'serve', '--host', '127.0.0.1', '--port', '8765'],
+    cwd: 'C:\\repo',
+    env: { PYTHONPATH: 'x' }
+  }
+  const c = buildDoctorCommand({ launch, jsonPath: 'C:\\t\\d.json' })
+  // 曾经这里 slice(1, at) 把 '-m','zfh_voice' 也当成全局参数带过去，
+  // 拼出 `python -m zfh_voice -m zfh_voice ... doctor` —— Python 直接报错，
+  // JSON 永不生成，表现为"体检超时"。整个命令必须逐字相等：
+  assert.deepEqual(c.argv, [
+    'py', '-m', 'zfh_voice',
+    '--backend', 'torch', '--model-dir', 'D:\\m',
+    'doctor', '--json', 'C:\\t\\d.json'
+  ])
+  assert.equal(c.argv.filter(x => x === 'zfh_voice').length, 1, 'zfh_voice 只能出现一次')
+  assert.equal(c.argv.filter(x => x === '-m').length, 1, '-m 只能出现一次')
+  assert.ok(!c.argv.includes('serve'), '不该把 serve 带进去')
+})
+
+ok('buildDoctorCommand：serve 前没有全局参数时也不出错', () => {
+  const c = buildDoctorCommand({
+    launch: { argv: ['py', '-m', 'zfh_voice', 'serve', '--port', '1'], cwd: 'c', env: {} },
+    jsonPath: 'X'
+  })
+  assert.deepEqual(c.argv, ['py', '-m', 'zfh_voice', 'doctor', '--json', 'X'])
+})
+
+ok('buildDoctorCommand：argv 形状异常时不硬套（宁可返回 null）', () => {
+  // 没有 `-m zfh_voice` 前缀（不是我们认知的形状）→ 只复用 python，不猜全局参数
+  const c = buildDoctorCommand({
+    launch: { argv: ['py', 'serve', '--port', '1'], cwd: 'c', env: {} },
+    jsonPath: 'X'
+  })
+  assert.deepEqual(c.argv, ['py', '-m', 'zfh_voice', 'doctor', '--json', 'X'])
+})
+
+ok('buildDoctorCommand：全局参数必须排在子命令前（CLI 的硬要求）', () => {
+  const launch = {
+    argv: ['py', '-m', 'zfh_voice', '--backend', 'torch', '--model-dir', 'D:\\m',
+      'serve', '--host', '127.0.0.1', '--port', '8765'],
+    cwd: 'C:\\repo',
+    env: { PYTHONPATH: 'x' }
+  }
+  const c = buildDoctorCommand({ launch, jsonPath: 'C:\\t\\d.json' })
+  assert.equal(c.argv[0], 'py')
+  assert.equal(c.argv[1], '-m')
+  assert.equal(c.argv[2], 'zfh_voice')
+  const iDoctor = c.argv.indexOf('doctor')
+  const iBackend = c.argv.indexOf('--backend')
+  assert.ok(iBackend > 0 && iBackend < iDoctor, '全局参数要在 doctor 之前')
+  assert.ok(!c.argv.includes('serve'), '不该把 serve 带进去')
+  assert.equal(c.argv[iDoctor + 1], '--json')
+  assert.equal(c.argv[iDoctor + 2], 'C:\\t\\d.json')
+})
+
+ok('buildDoctorCommand：没有启动信息时返回 null，不抛', () => {
+  assert.equal(buildDoctorCommand({ launch: null, jsonPath: 'x' }), null)
+  assert.equal(buildDoctorCommand({ launch: { argv: [] }, jsonPath: 'x' }), null)
+  assert.equal(buildDoctorCommand({ launch: { argv: ['py'] }, jsonPath: '' }), null)
+})
+
+ok('formatSetupGuidance：把根因和命令讲清楚', () => {
+  const g = formatSetupGuidance({
+    ran: true,
+    ok: true,
+    report: doctorReport({ deps_missing: ['numpy'] })
+  })
+  assert.ok(g.includes('缺 Python 依赖'), g)
+  assert.ok(g.includes('pip install -r requirements.txt'), g)
+  assert.ok(g.includes('docs/安装提示词.md'), '应指向文档')
+})
+
+ok('formatSetupGuidance：体检没拿到结果时也给出下一步', () => {
+  const g = formatSetupGuidance({ ran: false, ok: null, error: 'timeout-no-report' })
+  assert.ok(g.includes('doctor'), g)
+  assert.ok(g.includes('timeout-no-report'), '应带上失败原因便于排查')
+})
+
+await okAsync('createEnvProbe：读到 JSON 就成功', async () => {
+  const files = new Map()
+  const probe = createEnvProbe({
+    spawn: () => ({ pid: 1, terminate () {} }),
+    readFile: p => { if (!files.has(p)) throw new Error('ENOENT'); return files.get(p) },
+    removeFile: p => files.delete(p),
+    tmpFile: () => 'T',
+    sleep: async () => { files.set('T', JSON.stringify(doctorReport())) },
+    timeoutMs: 2000,
+    now: () => Date.now()
+  })
+  const r = await probe({ argv: ['py', 'serve'], cwd: 'c', env: {} })
+  assert.equal(r.ran, true)
+  assert.equal(r.ok, true)
+  assert.deepEqual(r.report.installed.onnx_ok, true)
+  assert.equal(files.size, 0, '读完应清理临时文件')
+})
+
+await okAsync('⭐ createEnvProbe：体检超时/坏 JSON → ran:false，不抛', async () => {
+  const probe = createEnvProbe({
+    spawn: () => ({ pid: 1, terminate () {} }),
+    readFile: () => { throw new Error('ENOENT') },
+    removeFile: () => {},
+    tmpFile: () => 'T',
+    sleep: async () => {},
+    timeoutMs: 1,          // 立刻超时
+    now: (() => { let t = 0; return () => (t += 10) })()
+  })
+  const r = await probe({ argv: ['py', 'serve'], cwd: 'c', env: {} })
+  assert.equal(r.ran, false)
+  assert.ok(r.error.includes('timeout'), `应报超时：${r.error}`)
+})
+
+await okAsync('createEnvProbe：没有 IO 接缝 → ran:false（对宿主零假设）', async () => {
+  const probe = createEnvProbe({})
+  const r = await probe({ argv: ['py', 'serve'], cwd: 'c', env: {} })
+  assert.equal(r.ran, false)
+  assert.equal(r.report, null)
+})
+
+await okAsync('⭐ 服务面：diagnose() 在无 subprocess 时不抛', async () => {
+  const mod = await import('../index.js')
+  const ctx = makeCtx()             // get('subprocess') → undefined
+  const svc = mod.apply(ctx, {})
+  const d = await svc.diagnose()
+  assert.ok(d !== null && typeof d === 'object')
+  assert.equal(d.ran, false, '起不了子进程时应如实说没跑成')
+  for (const f of ctx.effects) if (typeof f === 'function') assert.doesNotThrow(() => f())
+})
+
+await okAsync('⭐⭐ 服务面：setResident / setIdleAction 运行时生效', async () => {
+  const mod = await import('../index.js')
+  const ctx = makeCtx()
+  const svc = mod.apply(ctx, { resident: false, idleAction: 'stop' })
+  assert.equal(svc.status().resident, false)
+  assert.equal(svc.status().idleAction, 'stop')
+  svc.setResident(true)
+  assert.equal(svc.status().resident, true, '运行时常驻开关应生效')
+  svc.setIdleAction('unload')
+  assert.equal(svc.status().idleAction, 'unload')
+  svc.setIdleAction('bogus')
+  assert.equal(svc.status().idleAction, 'unload', '非法档位不该改掉现状')
+  svc.setResident(false)
+  assert.equal(svc.status().resident, false)
+  for (const f of ctx.effects) if (typeof f === 'function') assert.doesNotThrow(() => f())
+})
+
+await okAsync('⭐ status() 报出常驻三态（UI 靠它显示"模型在不在显存里"）', async () => {
+  const mod = await import('../index.js')
+  const ctx = makeCtx()
+  const svc = mod.apply(ctx, { resident: true })
+  const st = svc.status()
+  assert.equal(typeof st.resident, 'boolean', 'resident = 策略意图')
+  assert.equal(typeof st.processAlive, 'boolean', 'processAlive = 进程')
+  assert.ok('modelLoaded' in st, 'modelLoaded = 模型真实状态')
+  assert.equal(st.modelLoaded, null, '服务没跑时应为 null（未知）')
+  assert.equal(typeof st.idleAction, 'string')
+  for (const f of ctx.effects) if (typeof f === 'function') assert.doesNotThrow(() => f())
+})
+
+ok('DOCTOR_TIMEOUT_MS 有上限保护（不能无限等）', () => {
+  assert.ok(Number.isFinite(DOCTOR_TIMEOUT_MS) && DOCTOR_TIMEOUT_MS >= 5000)
 })
 
 console.log(`\n${failed === 0 ? '✅ 全部通过' : '❌ 有失败项'}`)
