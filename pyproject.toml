@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zfh-voice"
+version = "0.1.0"
+description = "庄方宜专属中文音色推理（ONNX / torch 双后端）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "onnxruntime>=1.17",
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "soxr>=0.3",
+    "transformers>=4.30",
+    "pypinyin>=0.49",
+    "cn2an>=0.5.22",
+    "jieba>=0.42",
+    "opencc-python-reimplemented>=0.1.7",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.7", "torchaudio>=2.7"]
+dev = ["pytest"]
+
+[project.scripts]
+zfh-voice = "zfh_voice.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"zfh_voice" = [
+    "_vendor/_gsv_text/*.txt",
+    "_vendor/_gsv_text/**/*.py",
+    "_vendor/_gsv_text/**/*.txt",
+    "_vendor/_gsv_text/**/*.json",
+    "_vendor/_gsv_text/**/*.rep",
+    "_vendor/_gsv_text/**/*.md5",
+]

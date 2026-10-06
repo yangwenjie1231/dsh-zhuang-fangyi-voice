@@ -1,0 +1,17 @@
+# ---- 核心推理（ONNX 后端）----
+# Windows 上想用任意显卡（含核显）加速，把下一行换成 onnxruntime-directml
+onnxruntime>=1.17
+numpy>=1.24
+soundfile>=0.12
+soxr>=0.3
+
+# ---- 文本前端 ----
+transformers>=4.30          # 仅用于 BERT tokenizer（多音字模型需要）
+pypinyin>=0.49
+cn2an>=0.5.22
+jieba>=0.42                 # 分词（有 jieba_fast 时自动优先用 fast 版）
+opencc-python-reimplemented>=0.1.7   # 繁简转换，纯 Python 无编译依赖
+
+# ---- 可选：torch 后端（更快，需要 GPU 环境）----
+# torch>=2.7
+# torchaudio>=2.7

@@ -1,0 +1,19 @@
+# 模型与缓存（从 Release 下载，不入库）
+models/
+cache/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# 临时文件
+*.part
+_aux.zip
