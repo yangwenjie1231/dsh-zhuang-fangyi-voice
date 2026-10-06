@@ -39,8 +39,17 @@ def detect_gpu():
 
 
 def has_module(name):
+    """该包能否被导入（不真的导入，只看能否找到）
+
+    必须容错：`find_spec` 在包损坏、命名空间冲突、或自定义 meta_path
+    finder 抛异常时都会抛出来。体检工具**不能因为"探测过程出错"而崩掉** ——
+    那会把"这个包坏了"误报成"体检工具坏了"。
+    """
     import importlib.util
-    return importlib.util.find_spec(name) is not None
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError, TypeError):
+        return False
 
 
 def ort_providers():
@@ -160,6 +169,19 @@ def recommend(info):
     return r, ("、".join(m) if m else "无，已就绪")
 
 
+def report_dict(info):
+    """机器可读的体检结果（供插件 / agent 读取，不解析文本）
+
+    插件侧拿不到子进程 stdout 的确定性保证，所以走"写文件再读"这条路。
+    """
+    recs, todo = recommend(info)
+    d = dict(info)
+    d["recommend"] = [{"tag": t, "text": x} for t, x in recs]
+    d["todo"] = todo
+    d["deps_missing"] = [k for k, v in info["deps"].items() if not v]
+    return d
+
+
 def format_report(info):
     L = []
     A = L.append
@@ -227,8 +249,18 @@ def format_report(info):
     return "\n".join(L)
 
 
-def main(model_dir=None):
+def main(model_dir=None, json_path=None):
+    """json_path 非空时写 JSON 而不是打印（给程序读）"""
     info = collect(model_dir)
+    if json_path:
+        import json
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(report_dict(info), f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            print(f"无法写入 {json_path}: {e}", file=sys.stderr)
+            return 2
+        return 0
     print(format_report(info))
     return 0
 

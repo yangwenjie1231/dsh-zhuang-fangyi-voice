@@ -165,7 +165,7 @@ def cmd_serve(args):
 
 def cmd_doctor(args):
     from .doctor import main as doctor_main
-    return doctor_main(args.model_dir)
+    return doctor_main(args.model_dir, json_path=getattr(args, "json", None))
 
 
 def cmd_status(args):
@@ -250,6 +250,8 @@ def main(argv=None):
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("doctor", help="环境体检：该装哪套模型")
+    p.add_argument("--json", default=None, metavar="PATH",
+                   help="把体检结果写成 JSON（供程序读取，不打印报告）")
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("status", help="检查模型是否就绪")
