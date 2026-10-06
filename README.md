@@ -34,13 +34,24 @@ git clone https://github.com/yangwenjie1231/dsh-zhuang-fangyi-voice
 cd dsh-zhuang-fangyi-voice
 
 pip install -r requirements.txt
-python download_models.py            # 从 Release 下载模型（约 1.5GB）
+python download_models.py            # 下载模型（约 1.4GB）
 
 python -m zfh_voice status           # 确认模型就绪
 python -m zfh_voice say "今天天气不错，我们一起出去走走吧。"
 ```
 
 输出默认落在 `out/out.wav`。
+
+### 模型下载源
+
+`download_models.py` **默认优先 ModelScope**（国内快），失败自动回退 GitHub：
+
+| 源 | 印尼 |
+|---|---|
+| ModelScope | `https://modelscope.cn/models/yangwenjie1231/dsh-zhuang-fangyi-voice` |
+| GitHub | `https://github.com/yangwenjie1231/dsh-zhuang-fangyi-voice/releases` |
+
+也可手动指定：`python download_models.py --source github`。
 
 ### 想更快？用 torch 后端
 
