@@ -863,6 +863,99 @@ export function createSupervisor (o = {}) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * 当前后端**是否依赖 torch**（`onnx` 不依赖）。
+ *
+ * @param {string} backend
+ * @returns {boolean}
+ */
+export function wantsTorchBackend (backend) {
+  return String(backend ?? 'auto') !== 'onnx'
+}
+
+/**
+ * **纯函数**：解释器不合适时给一条能直接照做的提示；没问题返回 null。
+ *
+ * 为什么需要它（新用户最容易踩的坑，而且是**静默**失败）：
+ * 插件默认按 配置 → `ZFH_VOICE_PYTHON` → `<repo>/.venv` → **PATH** 找解释器。
+ * 而 PATH 上那个 `python` 往往**没装 torch**（系统 Python、没激活的 conda…）。
+ * 于是 torch 后端起不来，用户看到的是一句莫名其妙的启动失败 ——
+ * 完全想不到是"用错了解释器"。
+ *
+ * @param {object} o
+ * @param {string} o.python - 实际会用到的解释器
+ * @param {string} o.backend - 配置的后端
+ * @param {boolean|null} o.hasTorch - 探测结果（null = 没探测出来）
+ * @param {string} [o.gsvRoot]
+ * @returns {string|null}
+ */
+export function interpreterWarning (o = {}) {
+  if (!wantsTorchBackend(o.backend)) return null
+  if (o.hasTorch !== false) return null
+  return [
+    `庄方宜语音：解释器 ${o.python} 里**没有 torch**，torch 后端起不来。`,
+    '  在插件配置里显式指定带 torch 的解释器（或设环境变量 ZFH_VOICE_PYTHON）：',
+    '    python: <你的 python.exe 路径>',
+    o.gsvRoot ? `  （当前的 gsvRoot = ${o.gsvRoot}）` : '  （还需要 gsvRoot 指向 GPT-SoVITS 检出目录）',
+    '  只想要能出声、不在乎速度：把 backend 改成 onnx（会慢约 13 倍）。'
+  ].join('\n')
+}
+
+/** 进程级缓存：同一个解释器只探一次（探测要 spawn，别每次 apply 都付一遍）。 */
+const torchProbeCache = new Map()
+
+/**
+ * 探测解释器是否**装了** torch。
+ *
+ * ⚠️ 必须用 `find_spec` 而**不是** `import torch` —— 后者会把整个 torch 栈
+ * 真的加载进来：**峰值 406MB / 1.9 秒**（实测）。而 find_spec 只定位包：
+ * **10MB / 0.1 秒**，便宜 40 倍。
+ *
+ * 这不是抠性能 —— 我第一版就是 `import torch`，每次 `apply()` 都 spawn 一次，
+ * 于是：测试套件 6 次 apply 翻腾 2.4GB；线上叠加常驻服务自己那份 torch 之后
+ * 直接把机器的提交量打满，Node 报 `Committing semi space failed`、
+ * Electron（DSH 本体）同样分配失败而**崩溃**。
+ * 一个"体检"绝不该吃掉 400MB。
+ *
+ * @param {object} o
+ * @param {(spec: object) => object|null} o.spawn
+ * @param {string} o.python
+ * @param {number} [o.timeoutMs]
+ * @returns {Promise<boolean|null>} true/false；探测不了（起不来/超时）→ null
+ */
+export async function probeTorch (o = {}) {
+  const spawn = typeof o.spawn === 'function' ? o.spawn : null
+  if (spawn === null) return null
+  const timeoutMs = Number.isFinite(o.timeoutMs) ? o.timeoutMs : 15000
+  let handle = null
+  const probe = 'import importlib.util, sys; sys.exit(0 if importlib.util.find_spec("torch") else 1)'
+  try {
+    handle = spawn({
+      argv: [o.python, '-c', probe],
+      cwd: o.cwd ?? process.cwd(),
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 4096 }, stderr: { maxBytes: 4096 } },
+      graceMs: 2000
+    })
+  } catch {
+    return null
+  }
+  if (handle === null || handle === undefined) return null
+  const done = handle.done
+  if (done === null || done === undefined || typeof done.then !== 'function') return null
+  const timeout = new Promise(resolve => setTimeout(() => resolve('timeout'), timeoutMs))
+  try {
+    const outcome = await Promise.race([Promise.resolve(done).catch(() => 'error'), timeout])
+    if (outcome === 'timeout') {
+      try { handle.terminate?.() } catch { /* 已退出 */ }
+      return null
+    }
+    if (outcome === 'error') return null
+    return outcome?.exitCode === 0
+  } catch {
+    return null
+  }
+}
+
+/**
  * cordis 插件入口。
  *
  * @param {object} ctx - cordis Context
@@ -889,6 +982,36 @@ export function apply (ctx, rawConfig) {
   })
 
   const client = createClient(cfg, logger)
+
+  // ⭐ **解释器自检**：PATH 上那个 `python` 常常没装 torch（系统 Python、
+  // 没激活的 conda…），而那是 torch 后端起不来的**静默**原因 ——
+  // 用户只会看到一句莫名其妙的启动失败，想不到是"用错了解释器"。
+  //
+  // 两条纪律（都是踩过才知道的）：
+  //   ① 探测用 `find_spec`，**不 import torch**（400MB vs 10MB，见 probeTorch 注释）；
+  //   ② **同一解释器只探一次**（进程级缓存）—— apply 可能被调用多次
+  //      （设置变化/HMR/测试），每次都 spawn 是浪费。
+  if (wantsTorchBackend(cfg.backend)) {
+    void (async () => {
+      try {
+        let probe = torchProbeCache.get(python)
+        if (probe === undefined) {
+          probe = probeTorch({
+            python,
+            cwd: repoDir,
+            spawn: spec => { try { return subprocessSpawn(spec) } catch { return null } }
+          })
+          torchProbeCache.set(python, probe)
+        }
+        const hasTorch = await probe
+        const warn = interpreterWarning({
+          python, backend: cfg.backend, hasTorch, gsvRoot: cfg.gsvRoot
+        })
+        if (warn !== null) logger?.warn?.(warn)
+      } catch { /* 自检失败不该影响加载 */ }
+    })()
+  }
+
 
   /** 宿主子进程接缝（doctor 与 serve 共用同一份） */
   const subprocessSpawn = spec => {

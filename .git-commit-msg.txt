@@ -1,0 +1,43 @@
+fix(probe): 解释器自检不能 import torch —— 那会吃 406MB，实测崩过宿主
+
+## 事故
+
+我上一版在 `apply()` 里加了解释器自检，用
+`python -c "import torch"` 探测有没有 torch。结果：
+
+  · 测试套件从"全绿"变成 `FATAL ERROR: Committing semi space failed`
+    （6 次 `apply()` → 6 次 torch 导入）；
+  · **DSH 本体（Electron）同时崩溃** —— 同一个原因。
+
+## 量化（本机实测）
+
+    python -c "import torch"                       峰值 406 MB / 1.9 秒
+    find_spec("torch")（只定位包，不加载）           峰值  10 MB / 0.1 秒
+
+`import torch` 会把整个 torch 栈真的加载进来。叠加常驻的推理服务
+（它自己也占着 torch）之后，机器的提交量被打满 → Node 报 commit 失败、
+Electron 分配失败 → 崩。
+
+**一个"体检"绝不该吃掉 400MB。**
+
+## 修法
+
+  · `probeTorch` 改用 `sys.exit(0 if importlib.util.find_spec("torch") else 1)`
+    —— 便宜 40 倍，语义一样（判"装没装"）；
+  · 加 `torchProbeCache`（进程级）：**同一解释器只探一次**。
+    `apply()` 可能被多次调用（设置变化 / HMR / 测试），每次都 spawn 是浪费；
+  · 超时仍会 `terminate()`，探测不出来一律返回 `null`（**宁可不说，也不谎报**）。
+
+## 断言（防再犯）
+
+  · `probeTorch` 的命令里必须出现 `find_spec`；
+  · 且**绝不能**出现 `import torch` —— 这两条把 400MB 的教训焊死在测试里；
+  · 退出码语义（0/1）、起不来/非 promise/超时不误判，各有断言。
+
+## 顺带
+
+新增 `tools/verify-plugin-live.mjs`：不需要 DSH 重启就能跑**真实代码路径**
+（import 本仓库 index.js，只把 `subprocess.spawn` 换成真的 child_process）。
+实测 16.2s → 172844 字节 WAV，backend=torch。
+
+测试 65 项全绿。

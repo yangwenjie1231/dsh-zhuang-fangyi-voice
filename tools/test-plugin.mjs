@@ -22,6 +22,9 @@ import {
   createSupervisor,
   buildDoctorCommand,
   classifyFailure,
+  wantsTorchBackend,
+  interpreterWarning,
+  probeTorch,
   formatSetupGuidance,
   createEnvProbe,
   RAPID_EXIT_MS,
@@ -559,6 +562,60 @@ ok('⭐⭐ classifyFailure：torch 路径就绪时，aux 缺失**不该**算问�
     installed: { onnx_ok: false, torch_ok: true, aux_ok: false, ref_ok: false }
   }), undefined, { backend: 'torch' })
   assert.equal(e.kind, 'missing-aux', `参考音频缺了仍是硬伤，实际 ${e.kind}`)
+})
+
+await okAsync('⭐ probeTorch：拿退出码判有没有 torch（超时不误判）', async () => {
+  const mk = code => () => ({ pid: 1, done: Promise.resolve({ exitCode: code }), terminate () {} })
+  assert.equal(await probeTorch({ spawn: mk(0), python: 'p' }), true, 'exit 0 → 有 torch')
+  assert.equal(await probeTorch({ spawn: mk(1), python: 'p' }), false, 'exit 1 → 没 torch')
+  assert.equal(await probeTorch({ spawn: () => { throw new Error('nope') }, python: 'p' }), null)
+  assert.equal(await probeTorch({ spawn: () => null, python: 'p' }), null)
+  assert.equal(await probeTorch({ spawn: () => ({ pid: 1, done: 42 }), python: 'p' }), null)
+  assert.equal(await probeTorch({ spawn: null, python: 'p' }), null)
+  let terminated = false
+  const hang = await probeTorch({
+    python: 'p', timeoutMs: 50,
+    spawn: () => ({ pid: 1, done: new Promise(() => {}), terminate () { terminated = true } })
+  })
+  assert.equal(hang, null, '挂住的进程不该让我们卡死')
+  assert.equal(terminated, true, '超时后应终止它')
+})
+
+await okAsync('⭐⭐ probeTorch：探测**不能** import torch（一条命令换 400MB）', async () => {
+  // 这条断言防的是我自己踩过的坑：第一版用 `-c "import torch"`，
+  // 峰值 406MB / 1.9s，而每次 apply() 都 spawn 一次 → 把机器提交量打满、
+  // Node 报 Committing semi space failed、Electron 崩溃。
+  // find_spec 只定位包：10MB / 0.1s。
+  let argv = null
+  await probeTorch({
+    python: 'p',
+    spawn: spec => { argv = spec.argv; return { pid: 1, done: Promise.resolve({ exitCode: 0 }), terminate () {} } }
+  })
+  const cmd = argv.join(' ')
+  assert.ok(cmd.includes('find_spec'), `必须用 find_spec 探测：${cmd}`)
+  assert.ok(!/\bimport torch\b/.test(cmd), `绝不能 import torch（会加载 400MB）：${cmd}`)
+})
+ok('⭐⭐ interpreterWarning：解释器没 torch 时要给出可照做的修法', () => {
+  // 新用户最容易踩的坑：PATH 上的 python 没装 torch（系统 Python / 没激活的 conda），
+  // 而这是**静默**失败 —— 用户看到的只是一句"服务起不来"。
+  const w = interpreterWarning({
+    python: 'D:\\Programs\\Python\\Python313\\python.exe',
+    backend: 'torch', hasTorch: false, gsvRoot: 'D:\\A\\voiceclone\\GPT-SoVITS'
+  })
+  assert.ok(w !== null, 'torch 后端 + 无 torch 必须警告')
+  assert.ok(w.includes('没有 torch'), '要点明原因：' + w)
+  assert.ok(w.includes('python:'), '要给出配置键名（照抄就能改）：' + w)
+  assert.ok(w.includes('ZFH_VOICE_PYTHON'), '要给出环境变量这条退路：' + w)
+  // 反向：探测不出来（null）时不乱报 —— 宁可不说，也不能谎报
+  assert.equal(interpreterWarning({ python: 'p', backend: 'torch', hasTorch: null }), null)
+  // 反向：有 torch 不报
+  assert.equal(interpreterWarning({ python: 'p', backend: 'torch', hasTorch: true }), null)
+  // 反向：onnx 后端不依赖 torch，不报
+  assert.equal(interpreterWarning({ python: 'p', backend: 'onnx', hasTorch: false }), null)
+  // wantsTorchBackend：auto 也算"可能要 torch"
+  assert.equal(wantsTorchBackend('auto'), true)
+  assert.equal(wantsTorchBackend('torch'), true)
+  assert.equal(wantsTorchBackend('onnx'), false)
 })
 
 ok('⭐ formatSetupGuidance：良性结论不打"环境还没配好"', () => {
