@@ -8,47 +8,25 @@
 
 ---
 
-## 🚀 一键安装：把下面这段话复制给 DSH
+## 🚀 安装
 
-不用自己研究装哪套模型 —— **把下面整段复制给 DSH（或任意编码 agent），它会自己判断并装好**：
+**新用户看这份就够：[docs/安装提示词.md](docs/安装提示词.md)**
+—— 里面有一段**可整段复制给 DSH（或任意编码 agent）的提示词**，
+它会自己体检环境、判断该装哪套模型、装好并验证。
 
-```text
-帮我安装 zfh-voice 音色插件（当前目录就是这个仓库，如果不在请先 git clone
-https://github.com/yangwenjie1231/dsh-zhuang-fangyi-voice 并 cd 进去）。
+最短路径（想自己动手）：
 
-请你自己判断该装哪套模型，不要问我，按下面的流程做：
-
-1. 先跑环境体检，拿到判断依据：
-     python -m zfh_voice doctor
-   它会输出 Python 版本、GPU 型号与显存、onnxruntime / torch 是否可用、
-   磁盘剩余空间、以及推荐方案。
-
-2. 据此决定：
-   - 后端：有 NVIDIA GPU 且 torch 可用 → 装 torch 后端（RTF≈0.45，快 13 倍）；
-     没有 GPU → 只装 ONNX 后端（不需要 CUDA）
-   - 精度：一般 fp16（1.4GB）；磁盘剩余不足 2GB 用 int8（0.87GB）
-   - torch 权重（229MB）只有用 torch 后端才需要
-   - 用 ONNX + Windows 想用任意显卡加速，可把 onnxruntime 换成 onnxruntime-directml
-
-3. 装依赖并下载模型（下载默认优先走 ModelScope，失败自动回退 GitHub）：
-     pip install -r requirements.txt
-     python download_models.py                     # ONNX（默认 fp16）
-     python download_models.py --with-torch        # 需要 torch 后端时追加
-   若只用 torch 后端，用 --torch-only 跳过 1.4GB 的 ONNX
-
-4. 验证：
-     python -m zfh_voice status      # 必须显示「就绪」
-     python -m zfh_voice say "今天天气不错，我们一起出去走走吧。"
-   确认生成的 wav 存在、时长合理、不是静音（可用 ffmpeg volumedetect 检查）。
-
-5. 遇到报错自己排查（报错信息里已带解决办法）。
-
-6. 完成后告诉我三件事：装了什么（后端/精度/体积）、模型放在哪个目录、
-   以后我要合成一句话该敲什么命令。
+```bash
+python -m zfh_voice doctor        # ① 体检：一次拿到全部判断依据与建议
+pip install -r requirements.txt   # ② 装依赖（照体检建议，有 N 卡才加装 torch）
+python download_models.py         # ③ 下模型（默认 fp16，约 1.4GB，优先走魔搭）
+python -m zfh_voice say "今天天气不错"   # ④ 出声
 ```
 
-> 安装是全自动的：模型下载源会自动择快（魔搭优先），失败自动换源。
-> 唯一需要联网的就是第 3 步。
+> `doctor` **不需要任何第三方依赖**就能跑（裸机器上也行）——
+> 它存在的意义就是在你什么都还没装的时候告诉你缺什么。
+
+装成 DSH 插件：见[下文](#装成-dsh-插件推荐)。
 
 ---
 
@@ -159,10 +137,24 @@ curl -X POST http://127.0.0.1:8765/tts \
 
 ## 常驻开关：省掉反复冷启动
 
-**CUDA / DirectML 下每次冷启动都要重付"加载 + 预热"的代价**（本机实测：
-ONNX 加载约 10 秒、首句预热约 15 秒）。所以提供了两条省时路径。
+**CUDA 下每次冷启动都要重付"加载 + 预热"的代价**（本机实测：加载约 10 秒、
+首句预热约 15 秒）。**在 DSH 里用插件时，这个开关归插件管**（见下）；
+下面是命令行/独立使用时的做法。
 
-### ① 让服务常驻（含自动释放）
+### 在插件里（DSH / 桌宠）
+
+| 想要什么 | 怎么做 |
+|---|---|
+| 一直占着，合成立刻开始 | 桌宠设置页打开「让语音模型常驻」，或 `zfhVoice.setResident(true)` |
+| 空闲后释放显存 | 关掉常驻，设「空闲多少秒后释放」（默认 300s） |
+| **释放的彻底程度** | `idleAction`：`stop` 杀进程（全释放、恢复慢）/ `unload` 只卸模型留进程（**显存同样释放、恢复快**） |
+| 现在到底占不占显存 | `zfhVoice.status().modelLoaded`（`true`/`false`/`null`=未知） |
+
+> ⚠️ **`status().resident` 是"配置意图"，`modelLoaded` 才是"真实状态"。**
+> 配了常驻但服务刚起、模型还在加载时，前者 `true`、后者 `false`。
+> 判断占不占显存要看 `modelLoaded`。
+
+### 在命令行（不经 DSH）
 
 ```bash
 # 一直常驻（默认）：模型不释放，响应最快
@@ -175,22 +167,21 @@ python -m zfh_voice serve --idle-timeout 300
 python -m zfh_voice serve --no-preload
 ```
 
-| 场景 | 建议 |
-|---|---|
-| 桌宠常开、随时可能说话 | 默认（`--idle-timeout 0`），响应最快 |
-| 显存紧张 / 与其他程序抢 GPU | `--idle-timeout 300`，空闲即让出 |
-| 只是偶尔用一下 | 不用服务，直接 `say` 即可 |
+> 插件模式下**不会**传 `--idle-timeout`，策略完全由插件决定 ——
+> 这个服务端参数是给"不经 DSH 直接跑 serve"的场景用的，避免两处打架。
 
 查看当前是否常驻：
 
 ```bash
 curl http://127.0.0.1:8765/health
 # {"ok":true, ..., "resident":true, "idle_seconds":3.2, "loads":1, "unloads":0}
+
+curl -X POST http://127.0.0.1:8765/unload    # 立刻释放模型（保留进程）
 ```
 
 > 有请求在途时**绝不会释放模型**（长合成可能远超 `idle-timeout`）。
 
-### ② 一次性命令复用常驻服务
+### 一次性命令复用常驻服务
 
 CLI 每次运行都是新进程，会重新加载模型。让它走已在运行的服务即可：
 
@@ -287,9 +278,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\install-dsh-plugin.ps1
 ```
 
 装好后宿主日志会出现「庄方宜语音：已挂载 zfhVoice 服务」。
+**若环境还没配好，日志会紧跟一段可照做的指引**（缺什么 + 敲什么命令），
+不必去翻源码猜。
 
 **给 AI 助手用的安装提示词**：`docs/安装提示词.md` —— 整段复制给
 Claude Code / Cursor / DSH 自己，它会按步骤配好环境（含每一步的确认标志）。
+
+### 挂给宿主的服务面
+
+| 方法 | 用途 |
+|---|---|
+| `synthesize(text)` | 合成一句；自动确保服务在跑，失败返回 `null`（**绝不抛**） |
+| `diagnose()` | 环境体检 → `{ran, ok, failure:{kind,summary,commands}, guidance}` |
+| `status()` | 只读状态（含常驻三态，见下） |
+| `setResident(bool)` | 运行时切换常驻（桌宠设置页用） |
+| `setIdleAction('stop'\|'unload')` | 切换空闲释放档位 |
+| `start()` / `stop()` | 显式起 / 停**本插件起的**服务 |
+| `configure(patch)` | 批量改配置 |
+
+`status()` 里的**常驻三态必须分清楚**：
+
+| 字段 | 含义 |
+|---|---|
+| `resident` | **策略意图**（配置里写的要不要常驻） |
+| `processAlive` | 服务进程在不在 |
+| `modelLoaded` | **模型真实是否在显存里**（`true`/`false`/`null`=未知） |
+
+配了常驻但模型还在加载时：`resident: true` 而 `modelLoaded: false`。
+桌宠设置页据此显示「运行中（模型已加载）」/「运行中（已释放显存）」/「未运行」。
 
 ### 插件配置（全部可选，留空即自动）
 
@@ -302,17 +318,21 @@ Claude Code / Cursor / DSH 自己，它会按步骤配好环境（含每一步�
 | `modelDir` | 自动 | 等价 `ZFH_MODEL_DIR` |
 | `host` / `port` | `127.0.0.1` / `8765` | 本地 HTTP 服务 |
 | `resident` | `false` | **常驻**：一直占显存但合成立刻开始；关闭则空闲后释放 |
-| `idleStopSec` | `300` | 非常驻时空闲多久停掉（0 = 不停） |
+| `idleStopSec` | `300` | 非常驻时空闲多久释放（0 = 不释放） |
+| `idleAction` | `stop` | 释放方式：`stop` 杀进程（全释放）/ `unload` 只卸模型（显存同样释放、恢复快） |
+| `startTimeoutMs` | `120000` | 等模型加载的上限（CUDA 首次较慢） |
 
-### 两条纪律（有测试盯着）
+### 三条纪律（有测试盯着）
 
 - **只停自己起的**：用户在终端手动 `python -m zfh_voice serve` 时，
   插件只连接、绝不终止；
 - **秒退不重启**：依赖没装/模型缺失时自动重启会变成重启风暴 ——
-  10 秒内退出只记错误，等用户显式操作。
+  10 秒内退出只记错误，等用户显式操作；
+- **拿不准就报"未知"**：探测失败时 `modelLoaded` 返回 `null` 而不是猜 `false`，
+  失败分类退 `unknown` 并透传原文 —— 宁可说不知道，也不给错结论。
 
-自测：`node tools/test-plugin.mjs`（30 项，覆盖 python 解析/命令组装/
-决策矩阵/监管器）。
+自测：`npm test`（57 项，覆盖 python 解析/命令组装/决策矩阵/监管器/
+常驻三态与两级释放/环境探测与失败分类）。
 
 ---
 
@@ -363,12 +383,22 @@ python -m zfh_voice say "台词" -o cache/line.wav
 
 ## 故障排查
 
+**第一步永远是 `python -m zfh_voice doctor`** —— 它不需要任何依赖就能跑，
+会直接告诉你缺什么、该敲什么命令。
+
 | 现象 | 原因与处理 |
 |---|---|
-| `找不到完整的模型目录` | 先跑 `python download_models.py`，或设 `ZFH_MODEL_DIR` |
+| 不知道缺什么 | `python -m zfh_voice doctor`（人看）/ `doctor --json out.json`（程序读） |
+| 插件日志说「环境还没配好 —— 缺 Python 依赖」 | 照日志给的命令 `pip install -r requirements.txt` |
+| 插件日志说「模型还没下载」 | `python download_models.py` |
+| 插件日志说「找不到 python 解释器」 | 装 Python 3.9+，或设 `ZFH_VOICE_PYTHON`，或填插件配置 `python` |
+| `找不到可用的模型目录` | 报错里已列出每个位置缺几项并给出对应命令；或设 `ZFH_MODEL_DIR` |
+| 只有 torch 权重、没下 ONNX | 正常：`doctor`/`status` 按后端分别校验，ONNX 与 torch 权重互不通用 |
 | `参考音频时长超出 3~10s` | 裁剪参考音频，或换一段 |
 | 输出听起来不像本人 | 参考音频不合适：换干净的 3~10 秒单句 |
-| 下载模型很慢 | GitHub 直连慢时可挂代理，或用 `--check` 确认已下好的部分 |
+| 下载模型很慢 | 优先走 ModelScope；慢时可挂代理，或用 `--check` 看已下好的部分 |
+| 装完插件仍报未运行 | 重启 DSH（ESM 缓存）；改 `index.js` 后 disable→enable 不够 |
+| 明明配了常驻却显示"已释放" | 看 `modelLoaded` 而不是 `resident`：后者是意图，前者是真实状态 |
 | `ZFH_G2PW_DIR 未设置` | 直接用 `TTS()` 会自动设置；手动 import 内嵌前端才会遇到 |
 
 ---
