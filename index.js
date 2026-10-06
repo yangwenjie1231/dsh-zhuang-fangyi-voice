@@ -45,6 +45,29 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+/**
+ * 子进程 stdio 的**唯一合法形状**（宿主 `SubprocessStdio` 契约，实测确认）：
+ *
+ *     interface SubprocessStdio {
+ *       stdin:  'ignore' | 'pipe' | {data}
+ *       stdout: 'pipe' | 'inherit' | {maxBytes}
+ *       stderr: 'pipe' | 'inherit' | {maxBytes}
+ *     }
+ *
+ * 两个坑：
+ *   ① `stdio` 必须是**对象** —— 传字符串会让宿主读到 `undefined.maxBytes`，
+ *      报 `Cannot read properties of undefined (reading 'maxBytes')`，
+ *      还被归类成 spawn-failed（看起来像"进程起不来"，其实是参数形状错）；
+ *   ② stdout/stderr **没有 `'ignore'`** —— 只有 pipe / inherit / {maxBytes}。
+ *
+ * 用 `{maxBytes}` 收集模式而不是 `'pipe'`：能读回输出做诊断
+ *（服务会打印"预热推理后端…"/"服务已启动"），而 pipe 需要自己消费流否则会堵。
+ */
+export const STDIO_CAPTURE = Object.freeze({
+  stdin: 'ignore',
+  stdout: { maxBytes: 256 * 1024 },
+  stderr: { maxBytes: 256 * 1024 }
+})
 /** 本插件的安装目录 —— 一切相对路径的锚点（因此不需要绝对路径配置）。 */
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -319,7 +342,12 @@ export function createEnvProbe (o = {}) {
 
     let handle = null
     try {
-      handle = spawn({ ...cmd, stdio: 'ignore', graceMs: 2000 })
+      // ⚠️ `stdio` 必须是**对象**，且 stdout/stderr 只接受
+      // `'pipe' | 'inherit' | {maxBytes}`（宿主 `SubprocessStdio` 契约，实测确认）。
+      // 传字符串 `'ignore'` 会让宿主读到 `undefined.maxBytes` →
+      // `Cannot read properties of undefined (reading 'maxBytes')`，
+      // 而且错误被归类成 spawn-failed，看起来像"进程起不来"。
+      handle = spawn({ ...cmd, stdio: STDIO_CAPTURE, graceMs: 2000 })
     } catch (error) {
       return { ...unavailable, error: `spawn-failed: ${error?.message ?? error}` }
     }
@@ -631,7 +659,10 @@ export function createSupervisor (o = {}) {
           argv: launch.argv,
           cwd: launch.cwd,
           env: launch.env,
-          stdio: 'ignore',
+          // 同 `createEnvProbe`：stdio 必须是对象；用 `{maxBytes}` 收集模式
+          // 还能顺手拿到服务日志（"预热推理后端…"/"服务已启动"），
+          // 排查时比"什么都没有"强得多。
+          stdio: STDIO_CAPTURE,
           graceMs: 2000
         })
         _spawnCount += 1
