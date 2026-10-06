@@ -9,6 +9,7 @@
   python -m zfh_voice cache --clear                  # 查看/清理缓存
 """
 import argparse
+import json
 import os
 import sys
 
@@ -39,24 +40,112 @@ def _build_tts(args):
                use_cache=not args.no_cache, **kw)
 
 
+# CUDA / DirectML 下每次冷启动都要重付"加载 + 预热"的代价
+# （本机实测：加载 3.7s、首句预热约 15s）。所以提供两条省时路径：
+#   1) serve --idle-timeout  让服务常驻，空闲超时才释放
+#   2) say --server          一次性命令直接复用已在运行的服务
+DEFAULT_SERVER = "http://127.0.0.1:8765"
+
+
+def _server_post(server, path, payload=None, timeout=600):
+    """用标准库 POST，避免引入额外依赖"""
+    import urllib.error
+    import urllib.request
+    url = server.rstrip("/") + path
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"无法连接常驻服务 {server}：{e}") from e
+
+
+def _server_alive(server, timeout=2):
+    try:
+        import urllib.request
+        with urllib.request.urlopen(server.rstrip("/") + "/health",
+                                    timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _remote_say(server, text, seed, out=None):
+    """通过常驻服务合成，返回 (wav_bytes, out_path)"""
+    audio = _server_post(server, "/tts", {"text": text, "seed": seed})
+    if out:
+        os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(audio)
+    return audio, out
+
+
 def cmd_say(args):
-    tts = _build_tts(args)
     text = " ".join(args.text).strip()
     if not text:
         print("错误：文本为空", file=sys.stderr)
         return 2
     out = args.out or os.path.join(args.outdir, "out.wav")
+
+    # 走常驻服务：省掉每次冷启动的加载/预热
+    server = _resolve_server(args)
+    if server:
+        try:
+            audio, _ = _remote_say(server, text, args.seed, out)
+            print(f"via {server}  {len(audio)/1024:.0f} KB  ->  "
+                  f"{os.path.abspath(out)}")
+            return 0
+        except RuntimeError as e:
+            if args.server == "auto":
+                print(f"（常驻服务不可用，回退到本地加载：{e}）",
+                      file=sys.stderr)
+            else:
+                print(f"错误：{e}", file=sys.stderr)
+                return 3
+
+    tts = _build_tts(args)
     r = tts.say(text, seed=args.seed, out=out, verbose=True)
     print(f"{r.duration:.2f}s  ->  {os.path.abspath(out)}")
     return 0
 
 
+def _resolve_server(args):
+    """决定是否走常驻服务：显式 --server URL / --server auto 探测 / 或 None"""
+    s = getattr(args, "server", None)
+    if not s:
+        return None
+    if s == "auto":
+        return DEFAULT_SERVER if _server_alive(DEFAULT_SERVER) else None
+    return s
+
+
 def cmd_batch(args):
-    tts = _build_tts(args)
-    if not os.path.exists(args.file):
-        print(f"错误：文件不存在 {args.file}", file=sys.stderr)
+    text_s = [l.strip() for l in open(args.file, encoding="utf-8")] \
+        if os.path.exists(args.file) else []
+    if not text_s:
+        print(f"错误：文件不存在或为空 {args.file}", file=sys.stderr)
         return 2
-    texts = [l.strip() for l in open(args.file, encoding="utf-8") if l.strip()]
+    texts = [l for l in text_s if l]
+
+    server = _resolve_server(args)
+    if server:
+        os.makedirs(args.outdir, exist_ok=True)
+        print(f"共 {len(texts)} 条 → {args.outdir}  (via {server})")
+        ok = 0
+        for i, t in enumerate(texts, 1):
+            p = os.path.join(args.outdir, f"{i:03d}.wav")
+            try:
+                audio, _ = _remote_say(server, t, args.seed, p)
+                ok += 1
+                print(f"  [{i}/{len(texts)}] {len(audio)/1024:6.0f} KB  {t[:30]}")
+            except RuntimeError as e:
+                print(f"  [{i}/{len(texts)}] 失败: {e}")
+        print(f"\n完成 {ok}/{len(texts)} 条")
+        return 0 if ok == len(texts) else 1
+
+    tts = _build_tts(args)
     print(f"共 {len(texts)} 条 → {args.outdir}")
     rs = tts.say_many(texts, args.outdir, seed=args.seed)
     total = sum(r.duration for r in rs)
@@ -68,7 +157,9 @@ def cmd_batch(args):
 def cmd_serve(args):
     from .server import serve
     tts = _build_tts(args)
-    serve(tts, host=args.host, port=args.port)
+    serve(tts, host=args.host, port=args.port,
+          idle_timeout=getattr(args, "idle_timeout", 0),
+          preload=not getattr(args, "no_preload", False))
     return 0
 
 
@@ -135,16 +226,27 @@ def main(argv=None):
     p = sub.add_parser("say", help="合成一句")
     p.add_argument("text", nargs="+")
     p.add_argument("-o", "--out", default=None)
+    p.add_argument("--server", default=None, nargs="?", const="auto",
+                   help="复用已在运行的常驻服务，省掉冷启动加载。"
+                        "给 URL 则连该地址；不带值(或 auto)则自动探测 "
+                        f"{DEFAULT_SERVER}")
     p.set_defaults(func=cmd_say)
 
     p = sub.add_parser("batch", help="批量合成（每行一条）")
     p.add_argument("file")
     p.add_argument("-d", "--outdir", default="out")
+    p.add_argument("--server", default=None, nargs="?", const="auto",
+                   help="同 say --server")
     p.set_defaults(func=cmd_batch)
 
-    p = sub.add_parser("serve", help="启动 HTTP 服务")
+    p = sub.add_parser("serve", help="启动 HTTP 常驻服务")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--idle-timeout", type=float, default=0,
+                   help="空闲多少秒后自动释放模型（腾出显存）；"
+                        "0 = 一直常驻（默认）")
+    p.add_argument("--no-preload", action="store_true",
+                   help="启动时不预热，模型推迟到首次请求才加载")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("doctor", help="环境体检：该装哪套模型")

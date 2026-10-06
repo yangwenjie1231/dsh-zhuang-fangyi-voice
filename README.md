@@ -136,11 +136,12 @@ python -m zfh_voice serve --host 127.0.0.1 --port 8765
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 健康检查，返回后端类型与就绪状态 |
+| GET | `/health` | 健康检查；含 `resident`（模型是否常驻）/ `idle_seconds` / `loads` / `unloads` |
 | GET | `/voices` | 可用音色列表 |
 | POST | `/tts` | body `{"text":"...","seed":null}` → 返回 **audio/wav** |
-| POST | `/tts.json` | 同上，但返回 `{ok,duration,wav_base64}` JSON |
+| POST | `/tts.json` | 同上，但返回 `{ok,duration,cached,cold_start,wav_base64}` JSON |
 | POST | `/cache/clear` | 清空合成缓存 |
+| POST | `/unload` | 立即释放模型（腾出显存），下次请求按需重载 |
 
 示例：
 
@@ -153,6 +154,62 @@ curl -X POST http://127.0.0.1:8765/tts \
 
 > 服务已开启 CORS，浏览器端可直接 `fetch` 取 `audio/wav` 播放。
 > 请求串行处理（推理后端非线程安全），并发请求会排队。
+
+---
+
+## 常驻开关：省掉反复冷启动
+
+**CUDA / DirectML 下每次冷启动都要重付"加载 + 预热"的代价**（本机实测：
+ONNX 加载约 10 秒、首句预热约 15 秒）。所以提供了两条省时路径。
+
+### ① 让服务常驻（含自动释放）
+
+```bash
+# 一直常驻（默认）：模型不释放，响应最快
+python -m zfh_voice serve
+
+# 空闲 300 秒后自动释放模型，腾出显存；下次请求按需重载
+python -m zfh_voice serve --idle-timeout 300
+
+# 启动时不预热，把加载推迟到首次请求
+python -m zfh_voice serve --no-preload
+```
+
+| 场景 | 建议 |
+|---|---|
+| 桌宠常开、随时可能说话 | 默认（`--idle-timeout 0`），响应最快 |
+| 显存紧张 / 与其他程序抢 GPU | `--idle-timeout 300`，空闲即让出 |
+| 只是偶尔用一下 | 不用服务，直接 `say` 即可 |
+
+查看当前是否常驻：
+
+```bash
+curl http://127.0.0.1:8765/health
+# {"ok":true, ..., "resident":true, "idle_seconds":3.2, "loads":1, "unloads":0}
+```
+
+> 有请求在途时**绝不会释放模型**（长合成可能远超 `idle-timeout`）。
+
+### ② 一次性命令复用常驻服务
+
+CLI 每次运行都是新进程，会重新加载模型。让它走已在运行的服务即可：
+
+```bash
+python -m zfh_voice say "今天天气不错。" --server
+# 或指定地址 / 批量
+python -m zfh_voice say "..." --server http://127.0.0.1:8765
+python -m zfh_voice batch lines.txt -d out/ --server
+```
+
+`--server` 不带值（或 `--server auto`）会自动探测 `127.0.0.1:8765`，
+探测不到则**回退到本地加载**，不会失败。
+
+实测对比（同一句话）：
+
+| 方式 | 耗时 |
+|---|---:|
+| 直接 `say`（冷启动） | ~35 s |
+| `say --server`（服务常驻 + 缓存命中） | **0.2 s** |
 
 ---
 

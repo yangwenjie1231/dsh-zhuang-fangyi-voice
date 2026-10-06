@@ -24,8 +24,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from . import __version__
 
 
-def make_handler(tts):
+def make_handler(tts, state=None):
     lock = threading.Lock()
+    state = state if state is not None else {}
+    state.setdefault("last_activity", time.time())
+    state.setdefault("loads", 0)
+    state.setdefault("unloads", 0)
+    # 在途请求计数：看门狗据此避开"正在合成"的窗口。
+    # 否则长合成期间 last_activity 不更新，看门狗会误判为空闲而把模型卸掉。
+    state.setdefault("inflight", 0)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = f"zfh-voice/{__version__}"
@@ -33,6 +40,9 @@ def make_handler(tts):
         def log_message(self, fmt, *args):
             if os.environ.get("ZFH_VERBOSE"):
                 super().log_message(fmt, *args)
+
+        def _touch(self):
+            state["last_activity"] = time.time()
 
         # ---- 工具 ----
         def _send(self, code, body, ctype="application/json; charset=utf-8"):
@@ -67,11 +77,20 @@ def make_handler(tts):
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/") or "/"
             if path in ("/health", "/"):
+                self._touch()
+                idle = time.time() - state["last_activity"]
                 return self._send(200, {
                     "ok": True, "service": "zfh-voice",
                     "version": __version__, "backend": tts._backend_kind,
-                    "ready": True})
+                    "ready": True,
+                    # 常驻状态：模型是否在内存/显存里，以及距上次活动多久
+                    "resident": tts.is_loaded,
+                    "idle_seconds": round(idle, 1),
+                    "idle_timeout": state.get("idle_timeout", 0),
+                    "loads": state["loads"], "unloads": state["unloads"],
+                })
             if path == "/voices":
+                self._touch()
                 return self._send(200, {
                     "ok": True,
                     "voices": [{
@@ -81,6 +100,12 @@ def make_handler(tts):
                         "backend": tts._backend_kind,
                         "ref": os.path.basename(tts.ref_wav or ""),
                     }]})
+            if path == "/unload":
+                self._touch()
+                done = tts.unload()
+                if done:
+                    state["unloads"] += 1
+                return self._send(200, {"ok": True, "unloaded": done})
             return self._send(404, {"ok": False, "error": "not found"})
 
         def do_POST(self):
@@ -90,23 +115,42 @@ def make_handler(tts):
             if path == "/tts.json":
                 return self._tts(binary=False)
             if path == "/cache/clear":
+                self._touch()
                 n = tts.clear_cache()
                 return self._send(200, {"ok": True, "cleared": n})
+            if path == "/unload":
+                self._touch()
+                done = tts.unload()
+                if done:
+                    state["unloads"] += 1
+                return self._send(200, {"ok": True, "unloaded": done})
             return self._send(404, {"ok": False, "error": "not found"})
 
         def _tts(self, binary):
+            self._touch()
+            state["inflight"] += 1
+            try:
+                return self._do_tts(binary)
+            finally:
+                state["inflight"] -= 1
+                self._touch()
+
+        def _do_tts(self, binary):
             req = self._read_json()
             text = (req.get("text") or "").strip()
             if not text:
                 return self._send(400, {"ok": False, "error": "text 不能为空"})
             seed = req.get("seed")
             t0 = time.time()
+            was_loaded = tts.is_loaded
             try:
                 with lock:                     # 后端非线程安全，串行化
                     r = tts.say(text, seed=seed, use_cache=True)
             except Exception as e:
                 return self._send(500, {"ok": False,
                                         "error": f"{type(e).__name__}: {e}"})
+            if not was_loaded and tts.is_loaded:
+                state["loads"] += 1
             if binary:
                 return self._send(200, r.to_wav_bytes(),
                                   ctype="audio/wav")
@@ -114,25 +158,70 @@ def make_handler(tts):
                 "ok": True, "duration": round(r.duration, 3),
                 "sr": r.sr, "cached": r.cached,
                 "elapsed": round(time.time() - t0, 3),
+                "cold_start": not was_loaded,
                 "wav_base64": base64.b64encode(r.to_wav_bytes()).decode()})
 
     return Handler
 
 
-def serve(tts, host="127.0.0.1", port=8765):
-    # 预热：提前加载后端，避免第一个请求等待
-    print("预热推理后端 ...")
-    t0 = time.time()
-    _ = tts.backend
-    print(f"就绪（{time.time()-t0:.1f}s）")
-    httpd = ThreadingHTTPServer((host, port), make_handler(tts))
+def _idle_watchdog(tts, state, idle_timeout, verbose=True):
+    """空闲超时后释放模型，腾出内存/显存；下次请求按需重新加载
+
+    注意：有在途请求时绝不释放——长合成可能远超 idle_timeout，
+    若此时卸载，模型会在推理过程中被回收。
+    """
+    while not state.get("stop"):
+        time.sleep(min(5, max(1, idle_timeout / 4)))
+        if state.get("stop"):
+            break
+        if state.get("inflight", 0) > 0:
+            continue                     # 正在合成，跳过本轮
+        if not tts.is_loaded:
+            continue
+        idle = time.time() - state["last_activity"]
+        if idle >= idle_timeout:
+            if tts.unload():
+                state["unloads"] += 1
+                if verbose:
+                    print(f"[idle] 空闲 {idle:.0f}s ≥ {idle_timeout}s，"
+                          f"已释放模型（下次请求将重新加载）", flush=True)
+
+
+def serve(tts, host="127.0.0.1", port=8765, idle_timeout=0, preload=True):
+    """
+    idle_timeout: 空闲多少秒后自动释放模型；0 = 一直常驻（默认）
+    preload:      启动时是否预先加载模型（预热）
+    """
+    state = {"last_activity": time.time(), "loads": 0, "unloads": 0,
+             "idle_timeout": idle_timeout}
+
+    if preload:
+        print("预热推理后端 ...")
+        t0 = time.time()
+        _ = tts.backend
+        state["loads"] = 1
+        print(f"就绪（{time.time()-t0:.1f}s）")
+    else:
+        print("已跳过预热（模型将在首次请求时加载）")
+
+    if idle_timeout and idle_timeout > 0:
+        th = threading.Thread(target=_idle_watchdog,
+                              args=(tts, state, idle_timeout), daemon=True)
+        th.start()
+        print(f"常驻策略: 空闲 {idle_timeout}s 后自动释放模型")
+    else:
+        print("常驻策略: 一直常驻（模型不释放）")
+
+    httpd = ThreadingHTTPServer((host, port), make_handler(tts, state))
     print(f"服务已启动: http://{host}:{port}")
-    print(f"  健康检查  GET  /health")
+    print(f"  健康检查  GET  /health     （含 resident / idle_seconds）")
     print(f"  合成      POST /tts        body: {{\"text\":\"...\"}} → audio/wav")
     print(f"  合成(JSON) POST /tts.json   → {{ok,duration,wav_base64}}")
+    print(f"  手动释放  POST /unload")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        state["stop"] = True
         httpd.server_close()

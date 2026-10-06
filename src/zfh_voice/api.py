@@ -106,6 +106,29 @@ class TTS:
             self._load_seconds = time.time() - t0
         return self._backend
 
+    @property
+    def is_loaded(self):
+        """模型当前是否常驻在内存/显存里"""
+        return self._backend is not None
+
+    def preload(self):
+        """预加载（把加载耗时前移，避免第一次合成等待）"""
+        _ = self.backend
+        return self._load_seconds
+
+    def unload(self):
+        """释放模型，腾出内存与显存；下次合成时按需重新加载"""
+        if self._backend is not None:
+            try:
+                self._backend.close()
+            except Exception:
+                pass
+            self._backend = None
+            import gc
+            gc.collect()
+            return True
+        return False
+
     # ---------- 缓存 ----------
     def _cache_key(self, text, seed):
         h = hashlib.sha1()
@@ -177,6 +200,5 @@ class TTS:
         return out
 
     def close(self):
-        if self._backend is not None:
-            self._backend.close()
-            self._backend = None
+        """同 unload()，语义上表示"用完释放" """
+        self.unload()
