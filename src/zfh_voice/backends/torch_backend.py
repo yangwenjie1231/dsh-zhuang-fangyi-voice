@@ -14,6 +14,11 @@ gsv_root 需包含 GPT_SoVITS/ 目录（可从官方仓库 clone）。
 """
 import os
 import sys
+import threading
+
+# os.chdir 是进程级状态：推理期间要切到 gsv_root（上游用相对路径），
+# 所以合成必须串行 —— 否则并发调用会互相把 cwd 搅乱。
+_SYNTH_LOCK = threading.Lock()
 
 import numpy as np
 
@@ -115,8 +120,24 @@ class TorchBackend(SynthBackend):
         if seed is not None:
             inputs["seed"] = int(seed)
         sr, wav = None, None
-        for _sr, _chunk in self.tts.run(inputs):   # run() 是生成器
-            sr, wav = _sr, _chunk
+        # ⚠️ **推理期间也必须 chdir 到 gsv_root** —— 这不是洁癖，是上游的硬依赖：
+        # GPT-SoVITS 内部大量使用**相对路径**找文本前端资源
+        #（`GPT_SoVITS/text/G2PWModel/`、pretrained_models 等）。
+        # 只在上面的 `__init__` 里 chdir 而这里不切，症状非常隐蔽：
+        # 它会去**联网下载** g2pw 模型（打印 "Downloading g2pw model..."），
+        # 下载失败就静默卡住 —— 看起来像"模型没装"，其实文件就在 gsv_root 里。
+        # 实测：cwd 在 GSV 根目录 → 3.5 秒出音频；cwd 在别处 → 卡在下载。
+        #
+        # `os.chdir` 是**进程级**状态，所以必须串行（HTTP 服务那边也有 lock，
+        # 这里再加一道，防止别的调用方并发进来把 cwd 搅乱）。
+        with _SYNTH_LOCK:
+            prev_cwd = os.getcwd()
+            try:
+                os.chdir(self.gsv_root)
+                for _sr, _chunk in self.tts.run(inputs):   # run() 是生成器
+                    sr, wav = _sr, _chunk
+            finally:
+                os.chdir(prev_cwd)
         if wav is None:
             raise BackendError("合成失败：未返回音频")
         wav = np.asarray(wav)
