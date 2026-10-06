@@ -42,6 +42,13 @@ ONNX_FILES = [
 ]
 PRECISIONS = ("fp16", "int8", "fp32")
 
+# torch 后端所需的原始权重（**不是** ONNX，onnxruntime 无法加载）。
+# 只有想用 torch 后端（GPU 下快 13 倍）时才需要下载，约 229 MB。
+TORCH_ASSETS = {
+    "torch__zfh-e4.ckpt": "GPT_weights_v2/zfh-e4.ckpt",
+    "torch__zfh_e6_s186.pth": "SoVITS_weights_v2/zfh_e6_s186.pth",
+}
+
 
 def target_dir(explicit=None):
     if explicit:
@@ -128,6 +135,9 @@ def main():
     ap.add_argument("--source", default=None,
                     choices=list(SOURCES),
                     help="只用一个下载源（默认 魔搭→GitHub 依次尝试）")
+    ap.add_argument("--with-torch", action="store_true",
+                    help="额外下载 torch 后端所需的 .ckpt/.pth（约 229MB，"
+                         "ONNX 后端用不到）")
     a = ap.parse_args()
 
     order = (a.source,) if a.source else DEFAULT_ORDER
@@ -141,11 +151,17 @@ def main():
         os.path.exists(os.path.join(d, "chinese-roberta-wwm-ext-large",
                                     "tokenizer.json"))
     ref_ok = os.path.exists(os.path.join(d, "ref", "default.wav"))
+    torch_dir = os.path.join(d, "torch_weights")
+    torch_need = [k for k, v in TORCH_ASSETS.items()
+                  if not os.path.exists(os.path.join(torch_dir,
+                                                     os.path.basename(v)))]
 
     if a.check:
         print(f"\nONNX  : {len(ONNX_FILES) - len(need)}/{len(ONNX_FILES)} 就绪")
         print(f"辅助  : {'就绪' if aux_ok else '缺失'}")
         print(f"参考音: {'就绪' if ref_ok else '缺失'}")
+        print(f"torch : {len(TORCH_ASSETS) - len(torch_need)}/{len(TORCH_ASSETS)} 就绪"
+              + ("" if a.with_torch else "（未请求，加 --with-torch 才会下载）"))
         if need:
             print("缺失: " + ", ".join(need))
         return 0 if (not need and aux_ok and ref_ok) else 1
@@ -192,7 +208,24 @@ def main():
             shutil.copy2(g_src, g_dst)
             print("  g2pW.onnx → G2PWModel/ (复制)")
 
-    # 4) 校验
+    # 4) torch 后端权重（可选）
+    if a.with_torch:
+        print(f"\n下载 torch 权重（{len(torch_need)} 个待下）")
+        os.makedirs(torch_dir, exist_ok=True)
+        for asset, rel in TORCH_ASSETS.items():
+            dst = os.path.join(torch_dir, os.path.basename(rel))
+            if os.path.exists(dst):
+                print(f"  已存在，跳过: {os.path.basename(dst)}")
+                continue
+            tmp = dst + ".part"
+            if fetch(asset, tmp, 150, order):
+                os.replace(tmp, dst)
+            else:
+                ok = False
+        if not torch_need:
+            print("  已全部就绪")
+
+    # 5) 校验
     print("\n=== 校验 ===")
     missing = []
     for f in ONNX_FILES:
@@ -202,12 +235,28 @@ def main():
         else:
             print(f"  MISS {f}")
             missing.append(f)
+    if a.with_torch:
+        for asset, rel in TORCH_ASSETS.items():
+            p = os.path.join(torch_dir, os.path.basename(rel))
+            if os.path.exists(p):
+                print(f"  OK   torch/{os.path.basename(rel):<22}"
+                      f"{os.path.getsize(p)/1024/1024:>8.1f} MB")
+            else:
+                print(f"  MISS torch/{os.path.basename(rel)}")
+                missing.append(os.path.basename(rel))
+
     if missing:
         print(f"\n仍缺 {len(missing)} 个文件")
         ok = False
     else:
         print("\n全部就绪。可以用了：")
         print('  python -m zfh_voice say "今天天气不错"')
+        if a.with_torch:
+            print("\ntorch 权重已下到 torch_weights/，用 --backend torch 时指定路径：")
+            for asset, rel in TORCH_ASSETS.items():
+                flag = "--gsv-root 或 gpt_path/sovits_path"
+                print(f"  {os.path.join(torch_dir, os.path.basename(rel))}")
+            print(f"  （{flag}）")
     return 0 if ok else 1
 
 

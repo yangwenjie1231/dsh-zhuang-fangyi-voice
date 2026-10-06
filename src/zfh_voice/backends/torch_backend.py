@@ -28,6 +28,14 @@ class TorchBackend(SynthBackend):
                  device="cuda", is_half=True, exp_name="zfh",
                  bert_dir=None, hubert_dir=None):
         super().__init__(model_dir)
+        # 解析模型目录（用于兜底查找 torch_weights/；找不到也不影响，
+        # 因为 torch 权重通常直接从 gsv_root 里取）
+        if self.model_dir:
+            from .. import paths
+            try:
+                self.model_dir = paths.resolve_model_dir(self.model_dir)
+            except FileNotFoundError:
+                self.model_dir = os.path.abspath(self.model_dir)
         self.gsv_root = os.path.abspath(gsv_root)
         if not os.path.isdir(os.path.join(self.gsv_root, "GPT_SoVITS")):
             raise BackendError(
@@ -46,12 +54,26 @@ class TorchBackend(SynthBackend):
             self.gsv_root, "GPT_weights_v2", f"{exp_name}-e4.ckpt")
         sov = sovits_path or os.path.join(
             self.gsv_root, "SoVITS_weights_v2", f"{exp_name}_e6_s186.pth")
+        # 回退：`download_models.py --with-torch` 会把权重放在
+        # <模型目录>/torch_weights/，这里自动兜住，省得手动搬文件
+        if self.model_dir:
+            if not os.path.exists(gpt):
+                cand = os.path.join(self.model_dir, "torch_weights",
+                                    f"{exp_name}-e4.ckpt")
+                if os.path.exists(cand):
+                    gpt = cand
+            if not os.path.exists(sov):
+                cand = os.path.join(self.model_dir, "torch_weights",
+                                    f"{exp_name}_e6_s186.pth")
+                if os.path.exists(cand):
+                    sov = cand
         for p in (gpt, sov):
             if not os.path.exists(p):
                 raise BackendError(
-                    f"找不到权重: {p}\n"
-                    "请把 Release 中的 .ckpt / .pth 放到对应目录，"
-                    "或用 gpt_path / sovits_path 指定。")
+                    f"找不到 torch 权重: {p}\n"
+                    "torch 后端需要 .ckpt/.pth —— **ONNX 文件无法被 torch 加载**。\n"
+                    "下载方式：python download_models.py --with-torch\n"
+                    "或用 gpt_path / sovits_path 显式指定路径。")
 
         bert = bert_dir or os.path.join(
             self.gsv_root, "GPT_SoVITS", "pretrained_models",

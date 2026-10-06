@@ -55,13 +55,30 @@ python -m zfh_voice say "今天天气不错，我们一起出去走走吧。"
 
 ### 想更快？用 torch 后端
 
+> ⚠️ **ONNX 模型无法被 torch 加载。** torch 后端需要原始的 `.ckpt` / `.pth` 权重
+> （共约 229 MB），要单独下载：
+>
+> ```bash
+> python download_models.py --with-torch    # 下载到 models/torch_weights/
+> ```
+
 ```bash
 pip install torch torchaudio
 git clone https://github.com/RVC-Boss/GPT-SoVITS third_party/GPT-SoVITS
-# 把 Release 里的 .ckpt / .pth 放进对应目录
+
+# 权重已下到 models/torch_weights/，后端会自动找到；也可用 gpt_path/sovits_path 指定
 python -m zfh_voice --backend torch \
     --gsv-root third_party/GPT-SoVITS say "今天天气不错。"
 ```
+
+两种后端的差异：
+
+| | onnx（默认） | torch |
+|---|---|---|
+| 依赖 | 仅 onnxruntime | torch + GPT-SoVITS 源码 |
+| 需要 GPU | 否（CPU / DirectML 均可） | 建议有 NVIDIA GPU |
+| 速度 | RTF ≈ 6 | **RTF ≈ 0.45（GPU）** |
+| 加载的模型 | `*.onnx` | `*.ckpt` / `*.pth` |
 
 ---
 
