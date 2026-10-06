@@ -88,8 +88,25 @@ def _matches(d, require):
         return has_torch_weights(d)
     if require == "aux":
         return has_aux(d)
-    # require=None：只要目录里有「任一」可识别的模型内容就认
-    return has_onnx(d) or has_torch_weights(d) or has_aux(d) or has_ref(d)
+    # require=None：只要目录里有「能支撑推理的内容」就认
+    # 注意：仅有 ref/ 音频不算——那无法合成，必须有模型或文本前端辅助文件
+    return has_onnx(d) or has_torch_weights(d) or has_aux(d)
+
+
+def _missing_in(d, require):
+    """列出该目录下按 require 还缺什么"""
+    if not d:
+        return []
+    if require == "onnx":
+        return [f for f in ONNX_FILES
+                if not os.path.exists(os.path.join(d, f))]
+    if require == "torch":
+        td = os.path.join(d, "torch_weights")
+        return [f"{f}（torch 后端用）" for f in ("zfh-e4.ckpt", "zfh_e6_s186.pth")
+                if not os.path.exists(os.path.join(td, f))]
+    if require == "aux":
+        return [f for f in AUX_FILES if not os.path.exists(os.path.join(d, f))]
+    return ["该目录里没有任何可识别的模型内容"]
 
 
 def resolve_model_dir(model_dir=None, must_exist=True, require=None):
@@ -100,6 +117,8 @@ def resolve_model_dir(model_dir=None, must_exist=True, require=None):
         "torch" → 必须有 torch_weights/ 下的 .ckpt/.pth
         "aux"   → 必须有文本前端辅助文件
         None    → 只要含任一类内容即可（默认；兼容只用 torch 后端的场景）
+
+    找不到时会抛出一段**可直接照做**的指引，而不是只说一句"找不到"。
     """
     cands = []
     if model_dir:
@@ -112,17 +131,43 @@ def resolve_model_dir(model_dir=None, must_exist=True, require=None):
     for d in cands:
         if _matches(d, require):
             return os.path.abspath(d)
-    if must_exist:
-        hint = {
-            "onnx": "请运行 `python download_models.py` 下载 ONNX 模型",
-            "torch": "请运行 `python download_models.py --with-torch` 下载 torch 权重",
-            "aux": "请运行 `python download_models.py`（辅助文件随包下载）",
-        }.get(require, "请运行 `python download_models.py` 下载模型")
-        raise FileNotFoundError(
-            f"找不到可用的模型目录（require={require or '任意'!r}）。已尝试：\n  "
-            + "\n  ".join(os.path.abspath(c) for c in cands)
-            + f"\n\n{hint}，或设置环境变量 ZFH_MODEL_DIR 指向模型目录。")
-    return os.path.abspath(cands[0]) if cands else None
+
+    if not must_exist:
+        return os.path.abspath(cands[0]) if cands else None
+
+    # 构造可执行的指引
+    lines = []
+    lines.append(f"未找到可用的模型目录（需要：{require or '任意一类模型'}）。")
+    lines.append("")
+    lines.append("已检查这些位置：")
+    for c in cands:
+        ap = os.path.abspath(c)
+        tag = "存在" if os.path.isdir(ap) else "不存在"
+        miss = _missing_in(ap, require)
+        extra = f"，缺 {len(miss)} 项" if (os.path.isdir(ap) and miss) else ""
+        lines.append(f"  [{tag}{extra}] {ap}")
+    lines.append("")
+    lines.append("解决办法（任选其一）：")
+    if require == "onnx":
+        lines.append("  1) 装 ONNX 模型（推荐 fp16，约 1.4GB）")
+        lines.append("       python download_models.py")
+        lines.append("     磁盘紧张可用 int8（0.87GB）：")
+        lines.append("       python download_models.py --precision int8")
+        lines.append("  2) 改用 torch 后端（不需要 ONNX，需要 .ckpt/.pth）")
+        lines.append("       python download_models.py --torch-only")
+        lines.append("       python -m zfh_voice --backend torch "
+                     "--gsv-root <GPT-SoVITS 目录> say \"你好\"")
+    elif require == "torch":
+        lines.append("  下载 torch 后端所需的原始权重（约 229MB）：")
+        lines.append("       python download_models.py --with-torch")
+        lines.append("     （若只用 ONNX 后端，则不需要这些权重）")
+    else:
+        lines.append("       python download_models.py")
+        lines.append("       python download_models.py --torch-only")
+    lines.append(f"  3) 指定已有目录：设环境变量 ZFH_MODEL_DIR，或用 --model-dir")
+    lines.append("  4) 不确定该装哪套？先跑环境体检：")
+    lines.append("       python -m zfh_voice doctor")
+    raise FileNotFoundError("\n".join(lines))
 
 
 def model_status(model_dir=None, backend="onnx"):

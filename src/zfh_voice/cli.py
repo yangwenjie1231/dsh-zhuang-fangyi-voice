@@ -12,6 +12,16 @@ import argparse
 import os
 import sys
 
+# ⚠️ 中文 Windows 控制台默认 GBK：`status` 里打印的 ✓/✗ 会直接
+# `UnicodeEncodeError: 'gbk' codec can't encode character '\u2717'` ——
+# 一个纯输出问题把整个命令弄崩（而且报错指向 print，看起来像别的毛病）。
+# 与 `build_dataset.py` / 上游 synth 脚本同一处理。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def _build_tts(args):
     from .api import TTS
@@ -60,6 +70,11 @@ def cmd_serve(args):
     tts = _build_tts(args)
     serve(tts, host=args.host, port=args.port)
     return 0
+
+
+def cmd_doctor(args):
+    from .doctor import main as doctor_main
+    return doctor_main(args.model_dir)
 
 
 def cmd_status(args):
@@ -131,6 +146,9 @@ def main(argv=None):
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("doctor", help="环境体检：该装哪套模型")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("status", help="检查模型是否就绪")
     p.set_defaults(func=cmd_status)

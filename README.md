@@ -8,6 +8,50 @@
 
 ---
 
+## 🚀 一键安装：把下面这段话复制给 DSH
+
+不用自己研究装哪套模型 —— **把下面整段复制给 DSH（或任意编码 agent），它会自己判断并装好**：
+
+```text
+帮我安装 zfh-voice 音色插件（当前目录就是这个仓库，如果不在请先 git clone
+https://github.com/yangwenjie1231/dsh-zhuang-fangyi-voice 并 cd 进去）。
+
+请你自己判断该装哪套模型，不要问我，按下面的流程做：
+
+1. 先跑环境体检，拿到判断依据：
+     python -m zfh_voice doctor
+   它会输出 Python 版本、GPU 型号与显存、onnxruntime / torch 是否可用、
+   磁盘剩余空间、以及推荐方案。
+
+2. 据此决定：
+   - 后端：有 NVIDIA GPU 且 torch 可用 → 装 torch 后端（RTF≈0.45，快 13 倍）；
+     没有 GPU → 只装 ONNX 后端（不需要 CUDA）
+   - 精度：一般 fp16（1.4GB）；磁盘剩余不足 2GB 用 int8（0.87GB）
+   - torch 权重（229MB）只有用 torch 后端才需要
+   - 用 ONNX + Windows 想用任意显卡加速，可把 onnxruntime 换成 onnxruntime-directml
+
+3. 装依赖并下载模型（下载默认优先走 ModelScope，失败自动回退 GitHub）：
+     pip install -r requirements.txt
+     python download_models.py                     # ONNX（默认 fp16）
+     python download_models.py --with-torch        # 需要 torch 后端时追加
+   若只用 torch 后端，用 --torch-only 跳过 1.4GB 的 ONNX
+
+4. 验证：
+     python -m zfh_voice status      # 必须显示「就绪」
+     python -m zfh_voice say "今天天气不错，我们一起出去走走吧。"
+   确认生成的 wav 存在、时长合理、不是静音（可用 ffmpeg volumedetect 检查）。
+
+5. 遇到报错自己排查（报错信息里已带解决办法）。
+
+6. 完成后告诉我三件事：装了什么（后端/精度/体积）、模型放在哪个目录、
+   以后我要合成一句话该敲什么命令。
+```
+
+> 安装是全自动的：模型下载源会自动择快（魔搭优先），失败自动换源。
+> 唯一需要联网的就是第 3 步。
+
+---
+
 ## 它提供哪些用法
 
 | 方式 | 适用场景 | 命令/代码 |
