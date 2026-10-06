@@ -230,14 +230,21 @@ export function buildDoctorCommand (o = {}) {
  *
  * @param {object|null} report - doctor --json 的结果
  * @param {string} [fallback] - 没有报告时的兜底描述
+ * @param {object} [opts]
+ * @param {string} [opts.backend] - 当前配置的后端（`auto`/`torch`/`onnx`）。
+ *   **判 aux 是否必需要靠它**：只有 ONNX 路径需要模型目录里的
+ *   G2PWModel + tokenizer；torch 路径从 gsvRoot 读，不要求那套文件。
  * @returns {{kind: string, summary: string, commands: string[]}}
  */
-export function classifyFailure (report, fallback = '服务起不来，原因未知') {
+export function classifyFailure (report, fallback = '服务起不来，原因未知', opts = {}) {
   if (report === null || report === undefined || typeof report !== 'object') {
     return { kind: 'unknown', summary: fallback, commands: [] }
   }
   const deps = Array.isArray(report.deps_missing) ? report.deps_missing : []
   const inst = report.installed ?? {}
+  // aux（G2PW + tokenizer）只有 ONNX 路径要；`auto` 时按"有 torch 权重就走 torch"推。
+  const backend = String(opts.backend ?? 'auto')
+  const auxRequired = backend === 'onnx' || (backend !== 'torch' && inst.torch_ok !== true)
 
   if (deps.length > 0) {
     return {
@@ -257,6 +264,22 @@ export function classifyFailure (report, fallback = '服务起不来，原因未
     }
   }
   if (inst.aux_ok !== true || inst.ref_ok !== true) {
+    // ⭐ **torch 后端不需要模型目录里的辅助包**（G2PWModel + tokenizer）——
+    // 那套文本前端它直接从 `gsvRoot`（GPT-SoVITS 检出）读。
+    // 所以"torch 权重齐 + 参考音频在"就不该报缺 aux：否则会给出误导性指引
+    //（实测：合成明明成功，却打印"环境还没配好，去补齐辅助包"，用户会白折腾）。
+    //
+    // 只有在**将要走 ONNX 路**时 aux 才是硬需求：
+    //   · 显式 `backend: 'onnx'`；
+    //   · 或 `auto` 且 torch 权重不在（那就会选 onnx）。
+    const wantsTorch = !auxRequired
+    if (inst.ref_ok === true && inst.torch_ok === true && wantsTorch) {
+      return {
+        kind: 'aux-not-needed-torch',
+        summary: 'torch 路径就绪（文本前端取自 GPT-SoVITS 检出，模型目录不需要辅助包）',
+        commands: []
+      }
+    }
     return {
       kind: 'missing-aux',
       summary: '模型在，但文本前端辅助文件或默认参考音频缺失',
@@ -273,16 +296,30 @@ export function classifyFailure (report, fallback = '服务起不来，原因未
  * @param {string} [docPath] - 详细文档路径
  * @returns {string}
  */
-export function formatSetupGuidance (probe, docPath = 'docs/安装提示词.md') {
+export function formatSetupGuidance (probe, docPath = 'docs/安装提示词.md', opts = {}) {
   const lines = []
-  if (probe === null || probe.ran !== true || probe.ok !== true) {
+  // ⚠️ "体检没拿到结果"（ran=false / 没 report）与"体检跑了但环境不全"
+  //（ok=false 且有 report）是**两件事**，不能合并成一句。
+  //
+  // 这里踩过一个真实的坑：原先把 `probe.ok !== true` 也归进这个分支，
+  // 于是本机（torch 路径完全可用、只是模型目录里没有 ONNX 那套辅助文件）
+  // 打印的是"环境还没配好（自动体检没拿到结果）"—— 既吓人又指向错误方向，
+  // 而 `classifyFailure` 里刚做好的"torch 路径就绪"判定根本没机会执行。
+  const hasReport = probe?.report !== null && probe?.report !== undefined
+  if (probe === null || probe.ran !== true || !hasReport) {
     lines.push('庄方宜语音：环境还没配好（自动体检没拿到结果）。')
-    lines.push(`  先手动跑一次：python -m zfh_voice doctor`)
+    lines.push('  先手动跑一次：python -m zfh_voice doctor')
     if (probe?.error) lines.push(`  （体检失败原因：${probe.error}）`)
     lines.push(`  详细步骤见 ${docPath}`)
     return lines.join('\n')
   }
-  const cls = classifyFailure(probe.report)
+  const cls = classifyFailure(probe.report, undefined, opts)
+  // ⭐ torch 路径就绪时 aux 缺失**不是问题** —— 不能打印"环境还没配好"，
+  // 那会把用户引去补一个他根本不需要的辅助包（实测：合成成功却报这个）。
+  if (cls.kind === 'aux-not-needed-torch') {
+    lines.push(`庄方宜语音：${cls.summary}`)
+    return lines.join('\n')
+  }
   lines.push(`庄方宜语音：环境还没配好 —— ${cls.summary}`)
   if (cls.commands.length > 0) {
     lines.push('  在仓库目录执行：')
@@ -631,7 +668,7 @@ export function createSupervisor (o = {}) {
     lastFailure = cls
     lastError = cls.summary + (cls.commands.length > 0 ? ` —— 修复：${cls.commands[0]}` : '')
     logger?.warn?.(probe !== null
-      ? formatSetupGuidance(probe)
+      ? formatSetupGuidance(probe, undefined, { backend: cfg.backend })
       : `庄方宜语音：${cls.summary}\n  先跑：python -m zfh_voice doctor`)
     return cls
   }
@@ -873,7 +910,19 @@ export function apply (ctx, rawConfig) {
     tmpFile: () => path.join(
       os.tmpdir(), `zfh-doctor-${process.pid}-${Date.now()}.json`)
   })
-  const runDoctor = () => envProbe(supervisor.status().launch)
+  /**
+   * 跑环境体检。
+   *
+   * ⚠️ 必须传**带 `env` 的那份 launch**（不是 `supervisor.status().launch`）——
+   * `status()` 有意只暴露 `{argv, cwd}`（那是对外的诊断快照，不该带环境变量），
+   * 而 doctor 和 serve 一样需要 `PYTHONPATH=<repo>/src`（包没 pip install 时
+   * 靠它才能 `python -m zfh_voice`）。
+   *
+   * 症状（实测）：体检永远报 `timeout-no-report`，而手动跑同一条命令 2.7 秒就出
+   * JSON —— 因为探针起的那次 `python -m zfh_voice doctor` 直接
+   * `No module named zfh_voice` 退出了，JSON 自然永远不生成。
+   */
+  const runDoctor = () => envProbe(launch)
 
   const supervisor = createSupervisor({
     spawn: subprocessSpawn,
@@ -902,9 +951,15 @@ export function apply (ctx, rawConfig) {
       const probe = await runDoctor().catch(() => null)
       if (!alive || probe === null) return
       if (probe.ran === true && probe.ok === true) {
-        const cls = classifyFailure(probe.report)
+        const cls = classifyFailure(probe.report, undefined, opts)
+    // ⭐ torch 路径就绪时 aux 缺失**不是问题** —— 不能打印"环境还没配好"，
+    // 那会把用户引去补一个他根本不需要的辅助包（实测：合成成功却报这个）。
+    if (cls.kind === 'aux-not-needed-torch') {
+      lines.push(`庄方宜语音：${cls.summary}`)
+      return lines.join('\n')
+    }
         if (cls.kind === 'unknown') return          // 环境没问题 → 不打扰
-        logger?.warn?.(formatSetupGuidance(probe))
+        logger?.warn?.(formatSetupGuidance(probe, undefined, { backend: cfg.backend }))
         return
       }
       logger?.warn?.(
@@ -953,7 +1008,7 @@ export function apply (ctx, rawConfig) {
         report: probe.report ?? null,
         failure,
         error: probe.error ?? null,
-        guidance: formatSetupGuidance(probe)
+        guidance: formatSetupGuidance(probe, undefined, { backend: cfg.backend })
       }
     },
 

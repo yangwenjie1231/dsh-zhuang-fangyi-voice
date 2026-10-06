@@ -530,6 +530,56 @@ ok('⭐ classifyFailure：依赖齐了但没模型', () => {
   assert.ok(c.commands.some(x => x.includes('download_models.py')))
 })
 
+ok('⭐⭐ classifyFailure：torch 路径就绪时，aux 缺失**不该**算问题（实测误报）', () => {
+  // 场景就是本机真实状态：模型目录里只有 torch_weights/ + ref/，
+  // 没有 G2PWModel / tokenizer（那套 torch 后端从 gsvRoot 读）。
+  // 原先这里会报 missing-aux 并让用户去 `download_models.py` 补一个
+  // 根本不需要的辅助包 —— 而合成其实是成功的。
+  const report = doctorReport({
+    installed: { onnx_ok: false, torch_ok: true, aux_ok: false, ref_ok: true }
+  })
+  // 显式 torch
+  const a = classifyFailure(report, undefined, { backend: 'torch' })
+  assert.equal(a.kind, 'aux-not-needed-torch', `torch 后端不该报 missing-aux：${a.kind}`)
+  assert.deepEqual(a.commands, [], '不该让用户去做无用功')
+  // auto 且 torch 权重在 → 会选 torch，同样不该报
+  const b = classifyFailure(report, undefined, { backend: 'auto' })
+  assert.equal(b.kind, 'aux-not-needed-torch', 'auto+有torch权重 也应判为无需 aux')
+  // ⭐ 反向：显式 onnx 时 aux 就是硬需求（缺了必须报）
+  const c = classifyFailure(report, undefined, { backend: 'onnx' })
+  assert.equal(c.kind, 'missing-aux', `onnx 后端缺 aux 必须报，实际 ${c.kind}`)
+  assert.ok(c.commands.some(x => x.includes('download_models.py')), '应给出补齐命令')
+  // ⭐ 反向：auto 但没有 torch 权重 → 会走 onnx，aux 也必需
+  const d = classifyFailure(doctorReport({
+    installed: { onnx_ok: false, torch_ok: false, aux_ok: false, ref_ok: true }
+  }), undefined, { backend: 'auto' })
+  assert.equal(d.kind, 'missing-models', `没模型时先报 missing-models，实际 ${d.kind}`)
+  // ⭐ 参考音频缺失是两条路都致命的 —— 即使 torch 就绪也不能算"没问题"
+  const e = classifyFailure(doctorReport({
+    installed: { onnx_ok: false, torch_ok: true, aux_ok: false, ref_ok: false }
+  }), undefined, { backend: 'torch' })
+  assert.equal(e.kind, 'missing-aux', `参考音频缺了仍是硬伤，实际 ${e.kind}`)
+})
+
+ok('⭐ formatSetupGuidance：良性结论不打"环境还没配好"', () => {
+  const probe = {
+    ran: true, ok: false,
+    report: doctorReport({
+      installed: { onnx_ok: false, torch_ok: true, aux_ok: false, ref_ok: true }
+    })
+  }
+  const text = formatSetupGuidance(probe, 'docs/安装提示词.md', { backend: 'torch' })
+  assert.ok(!text.includes('环境还没配好'),
+    `torch 就绪时不该说"环境还没配好"：${text}`)
+  assert.ok(text.includes('torch'), `应说明 torch 路径就绪：${text}`)
+  // 反向：真的缺东西时要照旧警告
+  const bad = formatSetupGuidance({
+    ran: true, ok: false,
+    report: doctorReport({ installed: { onnx_ok: false, torch_ok: false, aux_ok: false, ref_ok: true } })
+  }, 'docs/安装提示词.md', { backend: 'auto' })
+  assert.ok(bad.includes('环境还没配好'), `真缺东西必须警告：${bad}`)
+})
+
 ok('⭐ classifyFailure：模型在但辅助/参考音频缺', () => {
   const c = classifyFailure(doctorReport({
     installed: { onnx_ok: true, torch_ok: false, aux_ok: false, ref_ok: false }
