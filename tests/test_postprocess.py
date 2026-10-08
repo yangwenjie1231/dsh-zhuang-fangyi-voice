@@ -136,19 +136,36 @@ def test_describe():
 
 # ---------- 按模型版本选补偿量 ----------
 #
-# 背景（实测）：v2 的 8–12k 偏亮 4.2dB、12–16k 已对齐，所以需要 +3dB；
-# 而 v2Pro 的频谱本身就接近原声，加 3dB 会**过冲**（长文本频谱偏差 0.88 → 1.92）。
-# 两者起点不同，所以补偿量必须按版本取，不能全局一个值。
+# 校准口径是**长文本**（实际用途）。421 秒全文扫描，合计频谱偏差：
+#
+#   v2     0dB → 6.04 | 3dB → 8.51   ⇒ **0 最优**
+#   v2Pro  0dB → 1.60 | 1dB → 1.12   ⇒ **1 最优**
+#
+# v2 未补偿时 8–12k 就偏亮 4.2 dB，补偿只会让 12–16k 过冲，总量更差。
+#
+# ⚠️ 短句与长文本偏好**相反**（短句最优 3 dB）—— 已知口径冲突，
+# 这里以长文本为准。这条注释就是给未来改动的自己看的。
 
-def test_gain_v2_needs_compensation():
-    assert pp.gain_for_version("v2") == 3.0
-    assert pp.gain_for_version("v1") == 3.0
+def test_gain_v2_is_zero():
+    """v2 不该补偿 —— 它的 8–12k 已偏亮，补了 12–16k 会过冲"""
+    assert pp.gain_for_version("v2") == 0.0
+    assert pp.gain_for_version("v1") == 0.0
 
 
-def test_gain_v2pro_needs_none():
-    """v2Pro 不该补偿 —— 加了会过冲"""
-    assert pp.gain_for_version("v2Pro") == 0.0
-    assert pp.gain_for_version("v2ProPlus") == 0.0
+def test_gain_v2pro_is_one():
+    """v2Pro 只需 1 dB（长文本最优）"""
+    assert pp.gain_for_version("v2Pro") == 1.0
+    assert pp.gain_for_version("v2ProPlus") == 1.0
+
+
+def test_gain_is_small_everywhere():
+    """所有版本的补偿都应**很小**（≤1dB）
+
+    有过一次教训：+10 dB 的"高频提升"听感过头。宁可不足，不要过量。
+    若未来有人把某个版本调到 >2 dB，这条会失败并提醒复查。
+    """
+    for v, g in pp.BY_VERSION.items():
+        assert 0.0 <= g <= 2.0, f"{v} 的补偿 {g} dB 偏大，请先用长文本复验"
 
 
 def test_gain_unknown_version_is_safe():
@@ -159,7 +176,7 @@ def test_gain_unknown_version_is_safe():
 
 def test_gain_for_version_accepts_default():
     assert pp.gain_for_version("v9", default=1.5) == 1.5
-    assert pp.gain_for_version("v2", default=1.5) == 3.0   # 已知版本仍用表
+    assert pp.gain_for_version("v2Pro", default=1.5) == 1.0   # 已知版本仍用表
 
 
 def test_by_version_covers_all_known():

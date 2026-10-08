@@ -65,13 +65,18 @@ def test_postprocess_module_docstring_not_stale():
 # ---------- 代码里的真值 ----------
 
 def test_gain_default_matches_docs_claim():
-    """文档说 auto 时 v2Pro 是 0 —— 与代码一致"""
+    """文档里写的 auto 取值必须与代码真值一致
+
+    真实值见 `postprocess.BY_VERSION`（以长文本校准）：
+    v2 → 0、v2Pro → 1。
+    """
     from zfh_voice import postprocess as pp
-    assert pp.gain_for_version("v2Pro") == 0.0
-    assert pp.gain_for_version("v2") == 3.0
+    assert pp.gain_for_version("v2") == 0.0
+    assert pp.gain_for_version("v2Pro") == 1.0
+    # 文档必须提到这两个版本，且不能把 v2Pro 说成 0
     for rel in ("README.md", "docs/安装提示词.md"):
         txt = _read(rel)
-        assert "v2Pro" in txt, f"{rel} 应提到 v2Pro 的补偿取值"
+        assert "v2Pro" in txt, f"{rel} 应说明 v2Pro 的取值"
 
 
 # ---------- ONNX 清单 ----------
