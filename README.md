@@ -450,6 +450,31 @@ wav_bytes = r.to_wav_bytes()
 2. 仓库下的 `models/`
 3. `~/.cache/zfh-voice/models`
 
+### 模型目录里该放什么
+
+| 后端 | 必须有 |
+|---|---|
+| `onnx` | 7 个 ONNX + `G2PWModel/` + `chinese-roberta-wwm-ext-large/` + `ref/default.wav` |
+| `onnx`（**v2Pro 包**） | 上面那些 **再加 `sv_after_fbank.onnx`**（说话人编码器，v2Pro 特有） |
+| `torch` | `torch_weights/` 下的 GPT + SoVITS 权重，外加 `ref/default.wav` |
+
+**torch 权重不锁死文件名** —— 下面两种命名都认：
+
+```
+torch_weights/zfh-e4.ckpt              + zfh_e6_s186.pth          # 默认发行版
+torch_weights/<任意名>-e<N>.ckpt        + <任意名>_e<N>_s<N>.pth    # 自己重训的
+```
+
+> 为什么放宽：早先硬编码了具体文件名，导致**重训或换版本（如 v2Pro）后**
+> 目录被判成"没有模型"，报错只说"缺 1 项" —— 而它其实能正常合成。
+
+不确定缺什么就跑体检，它会明确列出：
+
+```bash
+python -m zfh_voice status
+# 缺 sv_after_fbank.onnx  (v2Pro 的说话人编码器)
+```
+
 ### 参考音频
 
 音色由**参考音频**驱动。默认使用模型包里的 `ref/default.wav`（约 8 秒）。
