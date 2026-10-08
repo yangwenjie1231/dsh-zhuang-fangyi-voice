@@ -98,6 +98,43 @@ def test_model_status_is_backend_aware(workdir):
     assert ok_onnx2 is True and not miss_onnx2
 
 
+def test_model_status_accepts_retrained_names(workdir):
+    """`status` 必须认自定义命名的权重（曾误报「缺 1 个文件」）
+
+    真事故：`model_status` 硬编码 `zfh-e4.ckpt` / `zfh_e6_s186.pth`，
+    于是 v2Pro 的 `zfh_v2pro_e12_s384.pth` 被当成缺失 ——
+    **能正常合成却报缺文件**，报错与事实相反。
+    """
+    d = os.path.join(workdir, "v2pro_style")
+    _touch(os.path.join(d, "torch_weights", "zfh-e4.ckpt"))
+    _touch(os.path.join(d, "torch_weights", "zfh_v2pro_e12_s384.pth"))
+    _, miss, ok = paths.model_status(d, backend="torch")
+    assert ok is True, f"自定义命名应被判为就绪，却报缺 {miss}"
+    assert not miss
+
+
+def test_model_status_reports_specific_gaps(workdir):
+    """不就绪时要说明**缺哪一类**，而不是只报个数"""
+    d = os.path.join(workdir, "partial")
+    _touch(os.path.join(d, "torch_weights", "zfh-e4.ckpt"))   # 只有 GPT
+    _, miss, ok = paths.model_status(d, backend="torch")
+    assert ok is False
+    joined = " ".join(miss)
+    assert "SoVITS" in joined or "_s" in joined, \
+        f"应指出缺 SoVITS 权重，实际: {miss}"
+    assert not any("GPT" in m and "ckpt" in m for m in miss), \
+        "GPT 权重已存在，不该报缺"
+
+
+def test_model_status_torch_dir_without_weights(workdir):
+    """torch_weights/ 存在但为空 → 应报缺，不该崩"""
+    d = os.path.join(workdir, "empty_tw")
+    os.makedirs(os.path.join(d, "torch_weights"), exist_ok=True)
+    _, miss, ok = paths.model_status(d, backend="torch")
+    assert ok is False
+    assert len(miss) >= 1
+
+
 def test_error_message_is_actionable(workdir, monkeypatch):
     """找不到模型时的报错必须包含可照做的指引，而不是一句「找不到目录」"""
     d = os.path.join(workdir, "nothing")

@@ -206,16 +206,47 @@ def model_status(model_dir=None, backend="onnx"):
 
     backend="onnx"  检查 7 个 ONNX + 辅助文件
     backend="torch" 检查 torch 权重 + 辅助文件
+
+    ⚠️ torch 分支**不能硬编码权重文件名**。早先写死
+    `zfh-e4.ckpt` / `zfh_e6_s186.pth`，导致用户重训或换版本后
+    （如 v2Pro 的 `zfh_v2pro_e12_s384.pth`）`status` 报「缺 1 个文件」，
+    但**实际能正常合成** —— 报错与事实相反，很难查。
+    这里改成复用 `has_torch_weights()`（它已支持自定义命名）。
     """
     d = model_dir or os.environ.get("ZFH_MODEL_DIR") or \
         os.path.join(repo_root(), "models")
     d = os.path.abspath(d)
-    required = list(AUX_FILES if backend == "onnx" else [])
-    required += (ONNX_FILES if backend == "onnx"
-                 else [os.path.join("torch_weights", "zfh-e4.ckpt"),
-                       os.path.join("torch_weights", "zfh_e6_s186.pth")])
-    missing = [f for f in required if not os.path.exists(os.path.join(d, f))]
-    return d, missing, len(missing) == 0
+
+    if backend == "onnx":
+        required = list(AUX_FILES) + list(ONNX_FILES)
+        missing = [f for f in required
+                   if not os.path.exists(os.path.join(d, f))]
+        return d, missing, len(missing) == 0
+
+    # torch：用模式匹配判断，而不是逐文件名
+    if has_torch_weights(d):
+        return d, [], True
+    # 不就绪时给出**具体缺什么**，便于排查
+    td = os.path.join(d, "torch_weights")
+    import re
+    names = []
+    if os.path.isdir(td):
+        try:
+            names = os.listdir(td)
+        except OSError:
+            names = []
+    has_gpt = any(n.endswith(".ckpt") and (re.search(r"-e\d+\.ckpt$", n)
+                                           or n.endswith("s1v3.ckpt"))
+                  for n in names)
+    has_sov = any(re.search(r"_e\d+_s\d+\.pth$", n) for n in names)
+    missing = []
+    if not has_gpt:
+        missing.append(os.path.join("torch_weights", "*-e<N>.ckpt  (GPT)"))
+    if not has_sov:
+        missing.append(os.path.join("torch_weights", "*_e<N>_s<N>.pth  (SoVITS)"))
+    if not missing:
+        missing.append(os.path.join("torch_weights", "(权重不完整)"))
+    return d, missing, False
 
 
 def _gsv_candidates(model_dir, rel_in_gsv, name, gsv_root=None, env_key=None):
