@@ -130,3 +130,105 @@ def test_sv_emb_contract():
     assert "20480" in src, "sv_emb 的 20480 维契约应写在注释里"
     assert "sv_after_fbank.onnx" in src
     assert "aten::fft_rfft" in src, "应说明为什么 fbank 要在 Python 侧算"
+
+
+# ---------- 体检要能发现缺 sv_after_fbank ----------
+
+def _mini_onnx(path, inputs):
+    """造一个只有图结构的小 onnx（用于测 needs_sv 判定，不需要真权重）"""
+    onnx = pytest.importorskip("onnx")
+    from onnx import TensorProto, helper
+    outs = [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])]
+    ins = [helper.make_tensor_value_info(n, TensorProto.FLOAT, [1])
+           for n in inputs]
+    node = helper.make_node("Identity", [inputs[0]], ["y"])
+    g = helper.make_graph([node], "t", ins, outs)
+    m = helper.make_model(g, opset_imports=[
+        helper.make_opsetid("", 17)])
+    onnx.save(m, path)
+    return path
+
+
+def test_onnx_needs_sv_detects_v2pro(tmp_path):
+    """有 sv_emb 输入 -> 判定为 v2Pro"""
+    from zfh_voice import paths
+    p = _mini_onnx(str(tmp_path / "v.onnx"),
+                   ["text_seq", "pred_semantic", "ref_audio", "sv_emb"])
+    assert paths.onnx_needs_sv(p) is True
+
+
+def test_onnx_needs_sv_false_for_v2(tmp_path):
+    """v2 的 vits 只有 3 个输入 -> 不判成 v2Pro"""
+    from zfh_voice import paths
+    p = _mini_onnx(str(tmp_path / "v.onnx"),
+                   ["text_seq", "pred_semantic", "ref_audio"])
+    assert paths.onnx_needs_sv(p) is False
+
+
+def test_onnx_needs_sv_survives_broken_file(tmp_path):
+    """坏文件不该让体检崩 —— 返回 False 让它去报别的错"""
+    from zfh_voice import paths
+    p = tmp_path / "broken.onnx"
+    p.write_bytes(b"not an onnx at all")
+    assert paths.onnx_needs_sv(str(p)) is False
+
+
+def test_onnx_needs_sv_missing_file(tmp_path):
+    from zfh_voice import paths
+    assert paths.onnx_needs_sv(str(tmp_path / "nope.onnx")) is False
+
+
+def test_model_status_flags_missing_sv(tmp_path):
+    """v2Pro 的包缺 sv_after_fbank 时，体检必须报出来
+
+    真事故场景：用户只下了 7 个 ONNX（v2 的清单），漏了 v2Pro 多的那个说话人
+    编码器。若体检说"就绪"，用户要到合成时才见到后端报错 —— 自相矛盾。
+    """
+    from zfh_voice import paths
+    d = str(tmp_path)
+    # 造齐 ONNX_FILES + AUX_FILES
+    for f in list(paths.ONNX_FILES) + list(paths.AUX_FILES):
+        fp = os.path.join(d, f.replace("/", os.sep))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        if f == "zfh_vits.onnx":
+            _mini_onnx(fp, ["text_seq", "pred_semantic", "ref_audio", "sv_emb"])
+        else:
+            with open(fp, "wb") as fh:
+                fh.write(b"\0")
+    _, miss, ok = paths.model_status(d, backend="onnx")
+    assert ok is False, "缺说话人编码器却报就绪"
+    assert any("sv_after_fbank" in m for m in miss), f"应指出缺 sv，实际 {miss}"
+
+
+def test_model_status_ok_when_sv_present(tmp_path):
+    """补上 sv_after_fbank 后应就绪"""
+    from zfh_voice import paths
+    d = str(tmp_path)
+    for f in list(paths.ONNX_FILES) + list(paths.AUX_FILES):
+        fp = os.path.join(d, f.replace("/", os.sep))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        if f == "zfh_vits.onnx":
+            _mini_onnx(fp, ["text_seq", "pred_semantic", "ref_audio", "sv_emb"])
+        else:
+            with open(fp, "wb") as fh:
+                fh.write(b"\0")
+    with open(os.path.join(d, "sv_after_fbank.onnx"), "wb") as fh:
+        fh.write(b"\0")
+    _, miss, ok = paths.model_status(d, backend="onnx")
+    assert ok is True, f"应就绪，却报缺 {miss}"
+
+
+def test_v2_package_does_not_require_sv(tmp_path):
+    """v2 的包（vits 无 sv_emb）**不该**要求说话人编码器"""
+    from zfh_voice import paths
+    d = str(tmp_path)
+    for f in list(paths.ONNX_FILES) + list(paths.AUX_FILES):
+        fp = os.path.join(d, f.replace("/", os.sep))
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        if f == "zfh_vits.onnx":
+            _mini_onnx(fp, ["text_seq", "pred_semantic", "ref_audio"])
+        else:
+            with open(fp, "wb") as fh:
+                fh.write(b"\0")
+    _, miss, ok = paths.model_status(d, backend="onnx")
+    assert ok is True, f"v2 包不该要求 sv，却报缺 {miss}"

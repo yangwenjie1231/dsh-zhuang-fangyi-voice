@@ -57,6 +57,23 @@ def has_onnx(d):
     return all(os.path.exists(os.path.join(d, f)) for f in ONNX_FILES)
 
 
+def onnx_needs_sv(vits_path):
+    """`zfh_vits.onnx` 是否声明了 `sv_emb` 输入（= v2Pro 的包）
+
+    只读**图结构**（`load_external_data=False`），不把 250 MB 权重读进内存 ——
+    实测 153 ms。用于体检时判断要不要额外的说话人编码器。
+    """
+    try:
+        import onnx
+        m = onnx.load(vits_path, load_external_data=False)
+    except Exception:  # noqa: BLE001  —— 缺 onnx / 文件坏了都不该让体检崩
+        return False
+    try:
+        return any(i.name == "sv_emb" for i in m.graph.input)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def has_torch_weights(d, exp_name=None):
     """torch 后端所需的两个权重是否齐全（在 <d>/torch_weights/ 下）
 
@@ -221,6 +238,16 @@ def model_status(model_dir=None, backend="onnx"):
         required = list(AUX_FILES) + list(ONNX_FILES)
         missing = [f for f in required
                    if not os.path.exists(os.path.join(d, f))]
+        # v2Pro 的包多一个说话人编码器。**必须在这里检查** —— 否则用户漏下它时
+        # `status` 会说"就绪"，直到真正合成才报错（而且报的是后端里的一句
+        # 「缺少 sv_after_fbank.onnx」，与"体检说就绪"自相矛盾）。
+        #
+        # 判定依据是 `zfh_vits.onnx` 是否声明了 `sv_emb` 输入 —— 比猜文件名可靠：
+        # 万一用户混用不同版本的 vits，也能发现。
+        if "zfh_vits.onnx" not in missing:
+            if onnx_needs_sv(os.path.join(d, "zfh_vits.onnx")):
+                if not os.path.exists(os.path.join(d, "sv_after_fbank.onnx")):
+                    missing.append("sv_after_fbank.onnx  (v2Pro 的说话人编码器)")
         return d, missing, len(missing) == 0
 
     # torch：用模式匹配判断，而不是逐文件名
