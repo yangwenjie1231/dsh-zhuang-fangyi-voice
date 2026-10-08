@@ -368,14 +368,23 @@ await okAsync('⭐⭐ apply() 能跑完并挂上 zfhVoice 服务（入口不能�
   for (const d of ctx.effects) if (typeof d === 'function') assert.doesNotThrow(() => d())
 })
 
-await okAsync('⭐ 没有 subprocess 服务时 apply 不抛（只是起不了进程）', async () => {
+await okAsync('⭐ 没有 subprocess 且端口上没有服务时，synthesize 返回 null（不抛）', async () => {
   const mod = await import('../index.js')
   const ctx = makeCtx()          // get('subprocess') → undefined
-  const svc = mod.apply(ctx, {})
+  // ⚠️ 必须用一个**确定没服务**的端口。
+  //
+  // 早先这条用的是默认 8765，于是当环境里恰好有服务（例如 DSH 自己已经把
+  // 插件启起来、或用户手动起过）时，`probe()` 会成功、synthesize 真的合成出
+  // 音频，断言 `r === null` 就失败 —— 而那是**正确行为**（复用已有服务是设计
+  // 意图，见 index.js 顶部「只停自己起的」那条纪律）。
+  //
+  // 所以这条测的是「**连不上任何服务**时不许抛」，用一个不会被占用的端口。
+  const port = 59999 + (process.pid % 1000)   // 避开常用端口，且各进程不同
+  const svc = mod.apply(ctx, { port, startTimeoutMs: 3000 })
   assert.ok(svc !== null)
-  // synthesize 会尝试启动进程 → 抛被内部接住 → 返回 null（绝不冒泡）
+  // 起不了进程 + 端口无人 → 返回 null（绝不冒泡）
   const r = await svc.synthesize('你好')
-  assert.equal(r, null, '起不了进程时应返回 null 而不是抛')
+  assert.equal(r, null, '连不上服务时应返回 null 而不是抛')
   for (const d of ctx.effects) if (typeof d === 'function') assert.doesNotThrow(() => d())
 })
 
