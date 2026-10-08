@@ -51,5 +51,10 @@ where = ["src"]
     "_vendor/_gsv_text/**/*.rep",
     "_vendor/_gsv_text/**/*.md5",
     # 中英混排所需的数据（随包分发，避免运行时联网下载）
-    "_vendor/nltk_data/**/*.json",
+    #
+    # ⚠️ `corpora/cmudict/cmudict` **没有扩展名** —— g2p_en 会
+    # `from nltk.corpus import cmudict` 再 `cmudict.dict()`，缺了它英文就废了，
+    # 而 nltk 的兜底是 `nltk.download('cmudict')`，在受限网络下会被挡住。
+    # 所以这里必须用 `**/*` 而不是只匹配 `*.json`。
+    "_vendor/nltk_data/**/*",
 ]

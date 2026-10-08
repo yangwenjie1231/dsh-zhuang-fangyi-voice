@@ -63,11 +63,13 @@ class OnnxBackend(SynthBackend):
 
         # BERT tokenizer（只需 tokenizer 文件，不需要权重）
         from transformers import AutoTokenizer
-        tok_dir = paths.bert_dir(self.model_dir)
+        tok_dir = paths.bert_dir(self.model_dir, getattr(self, "gsv_root", None))
         self.tokenizer = AutoTokenizer.from_pretrained(tok_dir)
 
         # 文本前端（会设置 ZFH_G2PW_DIR / ZFH_BERT_DIR）
-        frontend.prepare(self.model_dir)
+        # gsv_root 一并传：onnx 用户通常把资源放在模型目录，但有人两个后端
+        # 混着装，这时检出一份也应当能用（`paths` 按优先级找）。
+        frontend.prepare(self.model_dir, gsv_root=getattr(self, "gsv_root", None))
 
     # ---------------- 子步骤 ----------------
     def _text_ids(self, text):

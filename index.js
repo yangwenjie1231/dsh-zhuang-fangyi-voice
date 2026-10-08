@@ -95,6 +95,31 @@ export const IDLE_ACTIONS = ['stop', 'unload']
 /** 跑 `doctor` 体检的超时（首次导入可能慢，给足时间但不无限等）。 */
 export const DOCTOR_TIMEOUT_MS = 30000
 
+/**
+ * 默认随机种子。
+ *
+ * GPT-SoVITS 的 AR 解码不传 seed 时每次采样都不同，且**句子越短波动越大**：
+ * 实测 4 字句时长变异系数 23.5%、10 字句 17.0%、24 字句 10.3%；
+ * `让我想想` 在随机种子下曾产出 0.74s（正常 1.22s）—— 近乎截断。
+ *
+ * 固定种子牺牲一点多样性，换来可复现的稳定输出。设 `null` 可恢复随机。
+ */
+export const DEFAULT_SEED = 42
+
+/**
+ * 默认亮度补偿（dB），0 = 关闭。
+ *
+ * 模型输出 32kHz 而素材是 48kHz；48k→32k 下采样在 Nyquist(16kHz) 附近的
+ * 抗混叠滚降使 12–16kHz 比原声低约 2.8dB（实测 48k 原声 −46.8dB vs
+ * 合成 −49.6dB），听感偏「糊」。
+ *
+ * 校准所得参数 `fc=12kHz, gain=3dB, Q=1.0`，实测把 12–16kHz 补到 −46.7dB
+ * （误差 0.09dB），且 8–12kHz 仅 +0.09dB（不会过亮）。
+ *
+ * 默认仍为 0（关闭）：这是听感补偿而非信息恢复，应由用户显式开启。
+ */
+export const DEFAULT_BRIGHTNESS_DB = 0
+
 /** 启动后等健康检查的最长时间（CUDA 下加载模型可能几十秒）。 */
 export const DEFAULT_START_TIMEOUT_MS = 120000
 
@@ -178,6 +203,18 @@ export function buildServeCommand (o = {}) {
   if (gsv !== '') argv.push('--gsv-root', gsv)
   const model = String(o.modelDir ?? '').trim()
   if (model !== '') argv.push('--model-dir', model)
+  // seed / brightnessDb 必须放在全局参数区（子命令之前），
+  // 否则 argparse 会当成 `serve` 自己的参数而报错。
+  const seed = o.seed
+  if (seed === null) {
+    argv.push('--random-seed')            // 显式要求随机
+  } else if (Number.isFinite(Number(seed))) {
+    argv.push('--seed', String(Math.floor(Number(seed))))
+  }
+  const br = Number(o.brightnessDb)
+  if (Number.isFinite(br) && br !== 0) {
+    argv.push('--brightness-db', String(br))
+  }
   argv.push('serve', '--host', host, '--port', String(port))
   return {
     argv,
@@ -506,6 +543,19 @@ export function defaultConfig () {
      * 或 `unload`（只卸模型、留进程，**显存同样释放**、恢复快）。
      */
     idleAction: DEFAULT_IDLE_ACTION,
+    /**
+     * 随机种子。GPT-SoVITS 的 AR 解码在随机种子下**句子越短波动越大**
+     * （实测 4 字句时长变异 23.5%，24 字句仅 10.3%，偶发截断到正常时长一半）。
+     * 默认 42 保证可复现。设 null = 走上游随机采样（不推荐）。
+     */
+    seed: DEFAULT_SEED,
+    /**
+     * 亮度补偿（dB）。模型输出 32kHz，而素材是 48kHz；下采样在 Nyquist
+     * 附近的抗混叠滚降使 12–16kHz 比原声低约 2.8dB，听感偏「糊」。
+     * 校准值 3.0（fc=12kHz, Q=1.0，实测 12–16kHz 误差 0.09dB）。
+     * 0 = 关闭（默认，输出逐字节不变）。
+     */
+    brightnessDb: DEFAULT_BRIGHTNESS_DB,
     /** 等模型加载的上限。 */
     startTimeoutMs: DEFAULT_START_TIMEOUT_MS
   }
@@ -528,6 +578,18 @@ export function normalizeConfig (input, base = defaultConfig()) {
   if (Number.isFinite(port) && port > 0 && port < 65536) out.port = Math.floor(port)
   if (typeof input.resident === 'boolean') out.resident = input.resident
   if (IDLE_ACTIONS.includes(input.idleAction)) out.idleAction = input.idleAction
+  // seed: 允许 null（显式要求随机）；数字则夹到 int32 范围
+  if (input.seed === null) {
+    out.seed = null
+  } else if (input.seed !== undefined) {
+    const sd = Number(input.seed)
+    if (Number.isFinite(sd) && sd >= 0 && sd <= 2147483647) out.seed = Math.floor(sd)
+  }
+  // brightnessDb: 只允许 0~12dB（再高会明显过亮，校准值是 3）
+  if (input.brightnessDb !== undefined) {
+    const br = Number(input.brightnessDb)
+    if (Number.isFinite(br) && br >= 0 && br <= 12) out.brightnessDb = br
+  }
   const idle = Number(input.idleStopSec)
   if (Number.isFinite(idle) && idle >= 0 && idle <= 86400) out.idleStopSec = Math.floor(idle)
   const timeout = Number(input.startTimeoutMs)
@@ -956,6 +1018,33 @@ export async function probeTorch (o = {}) {
 }
 
 /**
+ * **纯函数**：从归一化配置推出 `buildServeCommand` 的入参。
+ *
+ * 存在的理由：`buildServeCommand` 的入参有 8 个以上，调用点若各写一遍，
+ * 新增配置项时极易漏传（`seed` / `brightnessDb` 就漏过一次 —— 单元测试
+ * 直接调 `buildServeCommand` 全绿，但配置根本到不了命令行）。
+ * 收敛到这里之后，新增配置只需改这一处。
+ *
+ * @param {object} cfg - normalizeConfig 的产物
+ * @param {string} python
+ * @param {string} repoDir
+ * @returns {object}
+ */
+export function serveOptions (cfg, python, repoDir) {
+  return {
+    python,
+    repoDir,
+    backend: cfg.backend,
+    gsvRoot: cfg.gsvRoot,
+    modelDir: cfg.modelDir,
+    host: cfg.host,
+    port: cfg.port,
+    seed: cfg.seed,
+    brightnessDb: cfg.brightnessDb
+  }
+}
+
+/**
  * cordis 插件入口。
  *
  * @param {object} ctx - cordis Context
@@ -971,15 +1060,7 @@ export function apply (ctx, rawConfig) {
     repoDir,
     exists: p => { try { return fs.existsSync(p) } catch { return false } }
   })
-  const launch = buildServeCommand({
-    python,
-    repoDir,
-    backend: cfg.backend,
-    gsvRoot: cfg.gsvRoot,
-    modelDir: cfg.modelDir,
-    host: cfg.host,
-    port: cfg.port
-  })
+  const launch = buildServeCommand(serveOptions(cfg, python, repoDir))
 
   const client = createClient(cfg, logger)
 
@@ -1167,19 +1248,11 @@ export function apply (ctx, rawConfig) {
     configure (patch) {
       const next = normalizeConfig({ ...cfg, ...(patch ?? {}) }, cfg)
       const nextRepo = next.repoDir !== '' ? next.repoDir : HERE
-      const nextLaunch = buildServeCommand({
-        python: resolvePython({
-          python: next.python,
-          repoDir: nextRepo,
-          exists: p => { try { return fs.existsSync(p) } catch { return false } }
-        }),
+      const nextLaunch = buildServeCommand(serveOptions(next, resolvePython({
+        python: next.python,
         repoDir: nextRepo,
-        backend: next.backend,
-        gsvRoot: next.gsvRoot,
-        modelDir: next.modelDir,
-        host: next.host,
-        port: next.port
-      })
+        exists: p => { try { return fs.existsSync(p) } catch { return false } }
+      }), nextRepo))
       Object.assign(cfg, next)
       supervisor.setConfig(cfg, nextLaunch)
       void supervisor.tick().catch(() => {})

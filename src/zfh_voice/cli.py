@@ -35,9 +35,13 @@ def _build_tts(args):
         kw["gsv_root"] = args.gsv_root
         if args.device:
             kw["device"] = args.device
+    # --random-seed 显式要求不固定种子（default_seed=None 会透传给后端）
+    dseed = None if getattr(args, "random_seed", False) else 42
     return TTS(backend=args.backend, model_dir=args.model_dir,
                ref_wav=args.ref, ref_text=args.ref_text,
                use_cache=not args.no_cache,
+               default_seed=dseed,
+               brightness_db=getattr(args, "brightness_db", 0.0),
                localize=(args.localize if args.localize is not None else "auto"),
                **kw)
 
@@ -74,9 +78,10 @@ def _server_alive(server, timeout=2):
         return False
 
 
-def _remote_say(server, text, seed, out=None):
+def _remote_say(server, text, seed, out=None, brightness_db=0.0):
     """通过常驻服务合成，返回 (wav_bytes, out_path)"""
-    audio = _server_post(server, "/tts", {"text": text, "seed": seed})
+    audio = _server_post(server, "/tts", {"text": text, "seed": seed,
+                                          "brightness_db": brightness_db})
     if out:
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
         with open(out, "wb") as f:
@@ -95,7 +100,8 @@ def cmd_say(args):
     server = _resolve_server(args)
     if server:
         try:
-            audio, _ = _remote_say(server, text, args.seed, out)
+            audio, _ = _remote_say(server, text, args.seed, out,
+                                   brightness_db=args.brightness_db)
             print(f"via {server}  {len(audio)/1024:.0f} KB  ->  "
                   f"{os.path.abspath(out)}")
             return 0
@@ -143,7 +149,8 @@ def cmd_batch(args):
         for i, t in enumerate(texts, 1):
             p = os.path.join(args.outdir, f"{i:03d}.wav")
             try:
-                audio, _ = _remote_say(server, t, args.seed, p)
+                audio, _ = _remote_say(server, t, args.seed, p,
+                                       brightness_db=args.brightness_db)
                 ok += 1
                 print(f"  [{i}/{len(texts)}] {len(audio)/1024:6.0f} KB  {t[:30]}")
             except RuntimeError as e:
@@ -220,7 +227,16 @@ def main(argv=None):
     ap.add_argument("--model-dir", default=None, help="模型目录")
     ap.add_argument("--ref", default=None, help="参考音频路径")
     ap.add_argument("--ref-text", default=None, help="参考音频对应文本")
-    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="随机种子。不传用默认 42（短句更稳，可复现）")
+    ap.add_argument("--random-seed", action="store_true",
+                    help="不固定种子，走上游随机采样。"
+                         "**不推荐**：短句会不稳定（实测 4 字句时长波动 23.5%%，"
+                         "偶发截断到正常时长的一半）")
+    ap.add_argument("--brightness-db", type=float, default=0.0,
+                    help="亮度补偿（dB），补偿 48k→32k 重采样在 12–16kHz 的"
+                         "滤波滚降。0 = 关闭（默认，输出逐字节不变）；"
+                         "校准值 3.0")
     ap.add_argument("--no-cache", action="store_true", help="禁用合成缓存")
     ap.add_argument("--localize", dest="localize", action="store_true",
                     default=None,

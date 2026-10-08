@@ -8,9 +8,13 @@
     GET  /health          → {"ok":true,"backend":"onnx","ready":true}
     GET  /voices          → 可用音色/配置信息
     POST /tts             → body {"text":"...","seed":null,"format":"wav"}
+                            可选 brightness_db（亮度补偿 dB，缺省 0 = 关闭）
                             返回 audio/wav 二进制
     POST /tts.json        → 返回 {"ok":true,"duration":1.23,"wav_base64":"..."}
     POST /cache/clear     → 清空合成缓存
+
+seed 语义：缺省/null 表示「未指定」，会用 TTS 实例的 default_seed（默认 42）
+保证短句可复现；显式传数字则用该值。
 
 只用标准库实现，避免额外依赖（不需要 fastapi/flask）。
 """
@@ -141,11 +145,14 @@ def make_handler(tts, state=None):
             if not text:
                 return self._send(400, {"ok": False, "error": "text 不能为空"})
             seed = req.get("seed")
+            # 亮度补偿：不传则用 TTS 实例的默认值（0 = 关闭）
+            br = req.get("brightness_db")
             t0 = time.time()
             was_loaded = tts.is_loaded
             try:
                 with lock:                     # 后端非线程安全，串行化
-                    r = tts.say(text, seed=seed, use_cache=True)
+                    r = tts.say(text, seed=seed, use_cache=True,
+                                brightness_db=br)
             except Exception as e:
                 return self._send(500, {"ok": False,
                                         "error": f"{type(e).__name__}: {e}"})

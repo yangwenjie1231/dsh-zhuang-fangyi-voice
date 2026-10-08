@@ -15,6 +15,7 @@ import path from 'node:path'
 import {
   resolvePython,
   buildServeCommand,
+  serveOptions,
   nextServiceAction,
   wavDurationMs,
   defaultConfig,
@@ -31,6 +32,8 @@ import {
   DEFAULT_IDLE_STOP_SEC,
   DEFAULT_IDLE_ACTION,
   IDLE_ACTIONS,
+  DEFAULT_SEED,
+  DEFAULT_BRIGHTNESS_DB,
   DOCTOR_TIMEOUT_MS
 } from '../index.js'
 
@@ -502,6 +505,95 @@ ok('nextServiceAction：resident=true 时 idleAction 不生效', () => {
     idleMs: 999999, idleLimitMs: 1000, launchable: true, rapidExit: false
   })
   assert.equal(d.why, 'resident-keep')
+})
+
+/* ── 8b. 短句稳定性：默认种子 + 亮度补偿 ──────────────────────────────── */
+
+section('8b. 短句稳定性（默认种子 / 亮度补偿）')
+
+ok('⭐ 默认 seed=42（短句不再随机截断）', () => {
+  assert.equal(DEFAULT_SEED, 42)
+  assert.equal(defaultConfig().seed, 42)
+})
+
+ok('⭐ seed 会传进 serve 命令，且在 `serve` 之前', () => {
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', seed: 42 })
+  const i = c.argv.indexOf('serve')
+  assert.ok(i > 0, '要有 serve 子命令')
+  assert.ok(c.argv.indexOf('--seed') > 0, '--seed 必须存在')
+  assert.ok(c.argv.indexOf('--seed') < i, '--seed 是全局参数，必须在 serve 前')
+  assert.equal(c.argv[c.argv.indexOf('--seed') + 1], '42')
+})
+
+ok('⭐ seed=null → --random-seed（显式要求随机，不是漏传）', () => {
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', seed: null })
+  assert.ok(c.argv.includes('--random-seed'), 'null 要变成显式开关')
+  assert.ok(!c.argv.includes('--seed'), 'null 不该再传 --seed')
+})
+
+ok('seed 非法值被过滤', () => {
+  assert.equal(normalizeConfig({ seed: null }).seed, null, 'null 是合法值')
+  assert.equal(normalizeConfig({ seed: 7 }).seed, 7)
+  assert.equal(normalizeConfig({ seed: -5 }).seed, 42, '负数回落默认')
+  assert.equal(normalizeConfig({ seed: 'abc' }).seed, 42, '非数字回落默认')
+  assert.equal(normalizeConfig({ seed: 1e12 }).seed, 42, '超 int32 回落默认')
+})
+
+ok('⭐ 亮度补偿默认 0 = 关闭（输出逐字节不变）', () => {
+  assert.equal(DEFAULT_BRIGHTNESS_DB, 0)
+  assert.equal(defaultConfig().brightnessDb, 0)
+  // 0 时**不传参数**，保证默认路径与改动前完全一致
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 0 })
+  assert.ok(!c.argv.includes('--brightness-db'), '0 不该传参数')
+})
+
+ok('⭐ 亮度补偿非 0 时传参，且在 `serve` 之前', () => {
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 3 })
+  const i = c.argv.indexOf('serve')
+  assert.ok(c.argv.indexOf('--brightness-db') > 0)
+  assert.ok(c.argv.indexOf('--brightness-db') < i, '必须是全局参数')
+  assert.equal(c.argv[c.argv.indexOf('--brightness-db') + 1], '3')
+})
+
+ok('brightnessDb 夹取到 0~12（防过亮）', () => {
+  assert.equal(normalizeConfig({ brightnessDb: 3 }).brightnessDb, 3)
+  assert.equal(normalizeConfig({ brightnessDb: 0 }).brightnessDb, 0)
+  assert.equal(normalizeConfig({ brightnessDb: 12 }).brightnessDb, 12)
+  assert.equal(normalizeConfig({ brightnessDb: -1 }).brightnessDb, 0, '负数回落 0')
+  assert.equal(normalizeConfig({ brightnessDb: 99 }).brightnessDb, 0, '过大回落 0')
+  assert.equal(normalizeConfig({ brightnessDb: 'x' }).brightnessDb, 0)
+})
+
+ok('doctor 命令沿用同一套 seed/brightness 参数（体检的就是要跑的那套）', () => {
+  const launch = buildServeCommand({ python: 'p', repoDir: 'R', seed: 42, brightnessDb: 3 })
+  const d = buildDoctorCommand({ launch, jsonPath: 'J' })
+  assert.ok(d, '要能拼出 doctor 命令')
+  assert.ok(d.argv.includes('--brightness-db'), 'doctor 也要带补偿参数')
+  assert.ok(d.argv.includes('--seed'))
+  assert.ok(!d.argv.includes('serve'), 'doctor 不该带 serve')
+})
+
+ok('⭐⭐ serveOptions：配置项**真的**会到命令行（曾漏传 seed/brightnessDb）', () => {
+  // 这一条守的是"调用点漏传"——只测 buildServeCommand 是抓不到的：
+  // 它本身工作正常，是 apply()/configure() 忘了把新配置塞进去。
+  const cfg = normalizeConfig({ seed: 7, brightnessDb: 3, backend: 'torch' })
+  const c = buildServeCommand(serveOptions(cfg, 'p', 'R'))
+  assert.equal(c.argv[c.argv.indexOf('--seed') + 1], '7', 'seed 必须从配置流到 argv')
+  assert.equal(c.argv[c.argv.indexOf('--brightness-db') + 1], '3', 'brightnessDb 必须流到 argv')
+  assert.ok(c.argv.indexOf('--seed') < c.argv.indexOf('serve'))
+})
+
+ok('serveOptions：默认配置 → 带 --seed 42、不带 --brightness-db', () => {
+  const c = buildServeCommand(serveOptions(defaultConfig(), 'p', 'R'))
+  assert.equal(c.argv[c.argv.indexOf('--seed') + 1], '42', '默认种子必须生效')
+  assert.ok(!c.argv.includes('--brightness-db'), '默认关闭补偿')
+})
+
+ok('serveOptions：seed=null → --random-seed', () => {
+  const cfg = normalizeConfig({ seed: null })
+  const c = buildServeCommand(serveOptions(cfg, 'p', 'R'))
+  assert.ok(c.argv.includes('--random-seed'))
+  assert.ok(!c.argv.includes('--seed'))
 })
 
 /* ── 9. 环境探测与失败分类（新用户路径）─────────────────────────────────── */

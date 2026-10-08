@@ -57,13 +57,44 @@ def has_onnx(d):
     return all(os.path.exists(os.path.join(d, f)) for f in ONNX_FILES)
 
 
-def has_torch_weights(d, exp_name="zfh"):
-    """torch 后端所需的两个权重是否齐全（在 <d>/torch_weights/ 下）"""
+def has_torch_weights(d, exp_name=None):
+    """torch 后端所需的两个权重是否齐全（在 <d>/torch_weights/ 下）
+
+    兼容两种命名，且**不锁死具体文件名**：
+
+      · 默认发行版：`zfh-e4.ckpt`（GPT）+ `zfh_e6_s186.pth`（SoVITS）
+      · 自己重训的：`<任意名>-e<N>.ckpt`（GPT）+ `<任意名>_e<N>_s<N>.pth`（SoVITS）
+
+    为什么放宽：原先硬编码了 `zfh-e4.ckpt` / `zfh_e6_s186.pth`，
+    导致用户**重训或换版本（如 v2Pro）后目录被判成"没有模型"** ——
+    而报错只说"缺 1 项"，不说缺什么，很难查。
+    """
     if not d or not os.path.isdir(d):
         return False
     td = os.path.join(d, "torch_weights")
-    return (os.path.exists(os.path.join(td, f"{exp_name}-e4.ckpt"))
-            and os.path.exists(os.path.join(td, f"{exp_name}_e6_s186.pth")))
+    if not os.path.isdir(td):
+        return False
+
+    # 优先认默认发行版的文件名（最常见，先命中就不用扫目录）
+    if exp_name:
+        if (os.path.exists(os.path.join(td, f"{exp_name}-e4.ckpt"))
+                and os.path.exists(os.path.join(td, f"{exp_name}_e6_s186.pth"))):
+            return True
+
+    try:
+        names = os.listdir(td)
+    except OSError:
+        return False
+
+    import re
+    has_gpt = any(
+        (n.endswith(".ckpt") and re.search(r"-e\d+\.ckpt$", n))
+        or n.endswith("s1v3.ckpt")
+        for n in names)
+    has_sovits = any(
+        n.endswith(".pth") and re.search(r"_e\d+_s\d+\.pth$", n)
+        for n in names)
+    return bool(has_gpt and has_sovits)
 
 
 def has_aux(d):
@@ -187,12 +218,84 @@ def model_status(model_dir=None, backend="onnx"):
     return d, missing, len(missing) == 0
 
 
-def g2pw_dir(model_dir):
-    return os.path.join(model_dir, "G2PWModel")
+def _gsv_candidates(model_dir, rel_in_gsv, name, gsv_root=None, env_key=None):
+    """文本前端资源（G2PW / BERT）的候选路径，按优先级排列。
+
+    ⚠️ 这是**踩过的坑**：`g2pw_dir`/`bert_dir` 原先只看模型目录
+    （`<model_dir>/G2PWModel`、`<model_dir>/chinese-roberta-wwm-ext-large`），
+    但 torch 用户的这两样东西**本来就在 GPT-SoVITS 检出里**：
+
+        <gsv_root>/GPT_SoVITS/text/G2PWModel
+        <gsv_root>/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large
+
+    于是 `frontend.prepare()` 抛 FileNotFoundError → `api._auto_localize()`
+    捕获后把 `localize` 判成 True → **中英混排永远走中文读法兜底**
+    （"Hello World" 念成"哈喽 达布流欧"），而且**不报任何错**。
+    表现是"英文能出声但念得怪"，极难定位 —— 所以这里按顺序找：
+
+      1. 显式环境变量（`ZFH_G2PW_DIR` / `ZFH_BERT_DIR`）—— 用户说了算；
+      2. 模型目录（onnx 那套就是这么装的）；
+      3. `gsv_root` 参数 / `ZFH_GSV_ROOT` / `--gsv-root` 指向的 GPT-SoVITS 检出。
+    """
+    env_key = env_key or ("ZFH_G2PW_DIR" if name == "G2PW" else "ZFH_BERT_DIR")
+    out = []
+    explicit = os.environ.get(env_key)
+    if explicit:
+        out.append(explicit)
+    if model_dir:
+        out.append(os.path.join(model_dir, name))
+    for root in _gsv_roots(gsv_root):
+        out.append(os.path.join(root, "GPT_SoVITS", rel_in_gsv))
+    return out
 
 
-def bert_dir(model_dir):
-    return os.path.join(model_dir, "chinese-roberta-wwm-ext-large")
+def _gsv_roots(extra=None):
+    """可能的 GPT-SoVITS 检出根目录（去重，保序）。
+
+    `extra` 是**调用方显式给的**（`--gsv-root` / `TorchBackend(gsv_root=…)`）——
+    它优先于环境变量与默认约定。**这条很关键**：服务进程的命令行里明明带着
+    `--gsv-root`，但前端原先只认环境变量，
+    于是"CLI 知道、前端不知道"，中英混排被静默降级成中文读法。
+    """
+    roots = []
+    if extra:
+        roots.append(extra)
+    for key in ("ZFH_GSV_ROOT", "GSV_ROOT"):
+        v = os.environ.get(key)
+        if v:
+            roots.append(v)
+    # 与 torch_backend 的默认约定一致：仓库同级 / 仓库内 third_party
+    rr = repo_root()
+    roots.append(os.path.join(os.path.dirname(rr), "GPT-SoVITS"))
+    roots.append(os.path.join(rr, "third_party", "GPT-SoVITS"))
+    seen, uniq = set(), []
+    for r in roots:
+        k = os.path.normcase(os.path.abspath(r))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(r)
+    return uniq
+
+
+def _first_existing(cands):
+    for c in cands:
+        if os.path.isdir(c):
+            return c
+    return cands[0] if cands else None
+
+
+def g2pw_dir(model_dir, gsv_root=None):
+    """G2PW 模型目录（**会去 GPT-SoVITS 检出里找**，见 `_gsv_candidates`）。"""
+    return _first_existing(_gsv_candidates(
+        model_dir, os.path.join("text", "G2PWModel"), "G2PWModel", gsv_root,
+        env_key="ZFH_G2PW_DIR"))
+
+
+def bert_dir(model_dir, gsv_root=None):
+    """BERT tokenizer 目录（同上，优先模型目录，回落 GPT-SoVITS 检出）。"""
+    return _first_existing(_gsv_candidates(
+        model_dir, os.path.join("pretrained_models", "chinese-roberta-wwm-ext-large"),
+        "chinese-roberta-wwm-ext-large", gsv_root, env_key="ZFH_BERT_DIR"))
 
 
 def vendor_dir():

@@ -28,6 +28,25 @@ from .base import BackendError, SynthBackend
 class TorchBackend(SynthBackend):
     name = "torch"
 
+    @staticmethod
+    def _pick_weight(d, preferred_name, pattern):
+        """在 d 下挑一个权重：先认首选文件名，再按模式扫。
+
+        多个候选时取**文件名排序最大**的（GPT-SoVITS 的轮次/步数后缀
+        是递增的，所以字典序最大 ≈ 训练最久的那一个）。
+        """
+        import re
+        if not d or not os.path.isdir(d):
+            return os.path.join(d, preferred_name)
+        pref = os.path.join(d, preferred_name)
+        if os.path.exists(pref):
+            return pref
+        try:
+            names = sorted(n for n in os.listdir(d) if re.search(pattern, n))
+        except OSError:
+            names = []
+        return os.path.join(d, names[-1]) if names else pref
+
     def __init__(self, gsv_root, model_dir=None, gpt_path=None,
                  sovits_path=None, ref_wav=None, ref_text=None,
                  device="cuda", is_half=True, exp_name="zfh",
@@ -55,23 +74,29 @@ class TorchBackend(SynthBackend):
         finally:
             os.chdir(prev_cwd)
 
-        gpt = gpt_path or os.path.join(
-            self.gsv_root, "GPT_weights_v2", f"{exp_name}-e4.ckpt")
-        sov = sovits_path or os.path.join(
-            self.gsv_root, "SoVITS_weights_v2", f"{exp_name}_e6_s186.pth")
-        # 回退：`download_models.py --with-torch` 会把权重放在
-        # <模型目录>/torch_weights/，这里自动兜住，省得手动搬文件
-        if self.model_dir:
-            if not os.path.exists(gpt):
-                cand = os.path.join(self.model_dir, "torch_weights",
-                                    f"{exp_name}-e4.ckpt")
-                if os.path.exists(cand):
-                    gpt = cand
-            if not os.path.exists(sov):
-                cand = os.path.join(self.model_dir, "torch_weights",
-                                    f"{exp_name}_e6_s186.pth")
-                if os.path.exists(cand):
-                    sov = cand
+        # 权重从哪来？优先级（高→低）：
+        #   1. 显式 gpt_path / sovits_path
+        #   2. **<model_dir>/torch_weights/** —— 用户明确指定的模型目录
+        #   3. <gsv_root>/GPT_weights_v2|SoVITS_weights_v2/ —— 上游默认位置
+        #
+        # ⚠️ 两条踩过的坑：
+        #
+        # ① 不能只按固定文件名找。用户重训/换版本后名字会变
+        #    （如 `zfh_v2pro_e12_s384.pth`），所以先按原名找，
+        #    再按"像 GPT / 像 SoVITS"的模式扫一遍。
+        #
+        # ② **model_dir 的权重必须优先于 gsv_root 的默认路径。**
+        #    早先写成"gsv_root 路径不存在时才回退到 model_dir"，
+        #    结果 gsv_root 里恰好有旧的 v2 权重时，**新模型被静默忽略** ——
+        #    合成照常出声、听起来"也还行"，但根本不是指定的那个模型。
+        #    这种静默错误极难发现，必须让显式指定的目录赢。
+        tw = os.path.join(self.model_dir, "torch_weights") if self.model_dir else None
+        gpt = gpt_path or (self._pick_weight(tw, f"{exp_name}-e4.ckpt",
+                                             r"-e\d+\.ckpt$") if tw else None) \
+            or os.path.join(self.gsv_root, "GPT_weights_v2", f"{exp_name}-e4.ckpt")
+        sov = sovits_path or (self._pick_weight(tw, f"{exp_name}_e6_s186.pth",
+                                                r"_e\d+_s\d+\.pth$") if tw else None) \
+            or os.path.join(self.gsv_root, "SoVITS_weights_v2", f"{exp_name}_e6_s186.pth")
         for p in (gpt, sov):
             if not os.path.exists(p):
                 raise BackendError(

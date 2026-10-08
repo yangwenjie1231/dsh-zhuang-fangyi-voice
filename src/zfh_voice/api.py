@@ -17,11 +17,19 @@ import os
 import re
 import time
 
-from . import audio, paths, textprep
+from . import audio, paths, postprocess, textprep
 from .backends import make_backend
 
 DEFAULT_REF_NAME = "ref/default.wav"
 DEFAULT_REF_TEXT_NAME = "ref/default.txt"
+
+# 不传 seed 时用的固定种子。
+#
+# 为什么需要：GPT-SoVITS 的 AR 解码在 seed=None 时每次采样都不同，而**句子越短
+# 波动越大**（实测 4 字句时长 CV 23.5%，24 字句仅 10.3%）。曾观测到
+# `让我想想` 在随机种子下产出 0.74s（正常 1.22s）—— 近乎截断。
+# 固定种子牺牲一点多样性，换来可复现的稳定输出。
+DEFAULT_SEED = 42
 
 # 随模型包一起分发的默认参考音频（若无则回落到内置示例）
 FALLBACK_REF_TEXT = "再好的武器，也得朝夕相处磨合上几天。等用惯了，我再和你说说感受，好吗？"
@@ -76,6 +84,7 @@ class SynthResult:
 class TTS:
     def __init__(self, backend="onnx", model_dir=None, cache_dir=None,
                  ref_wav=None, ref_text=None, use_cache=True, localize="auto",
+                 default_seed=DEFAULT_SEED, brightness_db=0.0,
                  **backend_kw):
         self._backend_kind = backend
         # 按后端分别校验：onnx 后端必须有 7 个 ONNX；
@@ -83,11 +92,20 @@ class TTS:
         require = "onnx" if backend == "onnx" else None
         self.model_dir = paths.resolve_model_dir(model_dir, require=require)
         self.use_cache = use_cache
+        # 不传 seed 时用的种子；None 表示沿用上游的随机采样（旧行为，不稳定）
+        self.default_seed = default_seed
+        # 亮度补偿：补偿 48k→32k 重采样在 12–16kHz 的滤波滚降（详见 postprocess）。
+        # 0.0 = 关闭（默认，逐字节不改动输出）
+        self.brightness_db = float(brightness_db or 0.0)
         # 英文怎么念：auto（默认）/ True（转中文读法）/ False（原样送前端）
         #   auto → 中英混排可用时**原样送**（真英文发音，实测更好）；
         #          不可用时转中文读法兜底（否则英文会被静默删掉）
         self.localize = localize
         self._localize_auto = None      # 惰性求值，避免构造时就加载前端
+        self._localize_reason = None    # 混排不可用时的原因（诊断用，不再静默）
+        # GPT-SoVITS 检出根目录：文本前端（G2PW/BERT）要在这里找。
+        # torch 后端的 backend_kw 里本来就带着它；onnx 那套不需要。
+        self._gsv_root = (backend_kw or {}).get("gsv_root")
         self._backend_kw = backend_kw
         self._backend = None
 
@@ -153,12 +171,24 @@ class TTS:
         return bool(value)
 
     def _auto_localize(self):
-        """中英混排可用 → 不转换（用真英文念）；否则转换（兜底）"""
+        """中英混排可用 → 不转换（用真英文念）；否则转换（兜底）
+
+        ⚠️ `gsv_root` **必须传下去**：torch 用户的 G2PW / BERT 在 GPT-SoVITS
+        检出里，只按模型目录找会抛 FileNotFoundError，被这里 `except` 吞掉后
+        判成"混排不可用" → **中英混排永远降级成中文读法**（"Hello World" 念成
+        "哈喽 达布流欧"）。这个失败**完全静默**，从输出上只看到"英文念得怪"，
+        所以实测花了很久才定位到"CLI 带了 --gsv-root、前端却不知道"。
+        """
         if self._localize_auto is None:
             try:
                 from . import frontend
-                self._localize_auto = not frontend.mixed_available()
-            except Exception:
+                # model_dir 与 gsv_root **都要传**：只传后者时 prepare() 会去
+                # 找默认模型目录而抛错（见 frontend.mixed_available 的说明）。
+                self._localize_auto = not frontend.mixed_available(
+                    gsv_root=self._gsv_root, model_dir=self.model_dir)
+            except Exception as exc:  # noqa: BLE001
+                # 不再静默：把原因留下来，状态/诊断里能看到
+                self._localize_reason = f"{type(exc).__name__}: {exc}"
                 self._localize_auto = True
         return self._localize_auto
 
@@ -196,11 +226,13 @@ class TTS:
         return False
 
     # ---------- 缓存 ----------
-    def _cache_key(self, text, seed):
+    def _cache_key(self, text, seed, brightness_db=0.0):
         h = hashlib.sha1()
         h.update(text.encode("utf-8"))
         h.update(str(seed).encode())
         h.update(self._backend_kind.encode())
+        # 补偿参数必须进键，否则改参数会命中旧缓存
+        h.update(f"br{brightness_db:g}".encode())
         try:
             st = os.stat(self.ref_wav)
             h.update(f"{self.ref_wav}:{st.st_size}:{int(st.st_mtime)}".encode())
@@ -221,8 +253,11 @@ class TTS:
 
     # ---------- 合成 ----------
     def say(self, text, seed=None, out=None, use_cache=None, verbose=False,
-            localize=None):
+            localize=None, brightness_db=None):
         """合成一句，返回 SynthResult
+
+        seed: 不传时用 self.default_seed（默认 42），保证短句可复现；
+              显式传 None 才走上游随机采样（不稳定，见 DEFAULT_SEED 注释）。
 
         localize: 是否把文本里的英文转成中文读法（默认跟随 self.localize）。
                   **必须做** —— 中文文本前端会**静默删掉**英文
@@ -232,6 +267,9 @@ class TTS:
         text = (text or "").strip()
         if not text:
             raise ValueError("文本为空")
+        # seed=None 是「未指定」而非「要随机」—— 用默认种子兜底
+        eff_seed = self.default_seed if seed is None else seed
+        eff_br = self.brightness_db if brightness_db is None else float(brightness_db)
         do_localize = self._resolve_localize(localize)
         spoken = textprep.localize(text) if do_localize else text
         # 提前拦住"念不出声"的输入 —— 否则后端会产出 0 音素并抛出
@@ -249,7 +287,7 @@ class TTS:
                    "请设 TTS(localize=True) 用中文读法念英文。"))
         use_cache = self.use_cache if use_cache is None else use_cache
         # 缓存键用**转换后**的文本：同一句的不同写法若读法相同，可复用
-        key = self._cache_key(spoken, seed)
+        key = self._cache_key(spoken, eff_seed, eff_br)
         cp = self._cache_path(key)
 
         if use_cache and os.path.exists(cp):
@@ -262,9 +300,13 @@ class TTS:
 
         t0 = time.time()
         wav, sr = self.backend.synth(
-            spoken, self.ref_wav, self.ref_text, seed=seed, verbose=verbose)
+            spoken, self.ref_wav, self.ref_text, seed=eff_seed, verbose=verbose)
         dt = time.time() - t0
         wav = audio.peak_normalize(wav, 0.95)
+        # 亮度补偿放在归一化之后：搁架会轻微改变峰值，先归一化再补偿
+        # 可保证输出电平一致（否则补偿后的句子会偏响）。
+        if eff_br:
+            wav = postprocess.apply_brightness(wav, sr, eff_br)
         if use_cache:
             audio.save_wav(cp, wav, sr)
         r = SynthResult(wav, sr, text, cached=False, seconds=dt,
@@ -274,7 +316,8 @@ class TTS:
             r.save(out)
         return r
 
-    def say_many(self, texts, out_dir, seed=None, verbose=True, localize=None):
+    def say_many(self, texts, out_dir, seed=None, verbose=True, localize=None,
+                 brightness_db=None):
         """批量合成，返回结果列表"""
         os.makedirs(out_dir, exist_ok=True)
         out = []
@@ -283,7 +326,8 @@ class TTS:
             if not t:
                 continue
             p = os.path.join(out_dir, f"{i:03d}.wav")
-            r = self.say(t, seed=seed, out=p, verbose=False, localize=localize)
+            r = self.say(t, seed=seed, out=p, verbose=False, localize=localize,
+                         brightness_db=brightness_db)
             out.append(r)
             if verbose:
                 mark = "缓存" if r.cached else f"{r.seconds:.1f}s"

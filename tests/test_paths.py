@@ -119,5 +119,56 @@ def test_has_aux_and_ref(workdir):
     assert paths.has_ref(d) is True
 
 
+# ---------- 自定义/重训权重的命名（曾经的静默失败） ----------
+#
+# 背景：`has_torch_weights` 曾**硬编码** `zfh-e4.ckpt` / `zfh_e6_s186.pth`。
+# 用户重训或换版本（如 v2Pro）后文件名变成 `zfh_v2pro_e12_s384.pth`，
+# 目录就被判成"没有模型"；而报错只说"缺 1 项"，不说缺什么，很难查。
+
+def test_retrained_weight_names_recognized(workdir):
+    """重训产物的命名（<名>_e<N>_s<N>.pth）也要被认出来"""
+    d = os.path.join(workdir, "retrained")
+    _touch(os.path.join(d, "torch_weights", "zfh_v2pro_e12_s384.pth"))
+    _touch(os.path.join(d, "torch_weights", "zfh-e4.ckpt"))
+    assert paths.has_torch_weights(d) is True
+    assert _selected(d, "torch") is True
+
+
+def test_v2pro_style_both_new_names(workdir):
+    """GPT 与 SoVITS 都用新命名时也要认"""
+    d = os.path.join(workdir, "both_new")
+    _touch(os.path.join(d, "torch_weights", "mymodel-e8.ckpt"))
+    _touch(os.path.join(d, "torch_weights", "mymodel_e10_s320.pth"))
+    assert paths.has_torch_weights(d) is True
+
+
+def test_only_gpt_weight_is_not_enough(workdir):
+    """只有 GPT 没有 SoVITS → 不算完整（否则会在加载时炸）"""
+    d = os.path.join(workdir, "gpt_only")
+    _touch(os.path.join(d, "torch_weights", "zfh-e4.ckpt"))
+    assert paths.has_torch_weights(d) is False
+
+
+def test_only_sovits_weight_is_not_enough(workdir):
+    d = os.path.join(workdir, "sov_only")
+    _touch(os.path.join(d, "torch_weights", "zfh_e6_s186.pth"))
+    assert paths.has_torch_weights(d) is False
+
+
+def test_arbitrary_files_do_not_count(workdir):
+    """随便两个文件不该被当成权重（避免假阳性）"""
+    d = os.path.join(workdir, "junk")
+    _touch(os.path.join(d, "torch_weights", "notes.ckpt"))
+    _touch(os.path.join(d, "torch_weights", "data.pth"))
+    assert paths.has_torch_weights(d) is False
+
+
+def test_default_names_still_win(workdir):
+    """默认发行版命名仍应被优先识别（不破坏现有安装）"""
+    d = _build(workdir, "default", torch_=True)
+    assert paths.has_torch_weights(d) is True
+    assert paths.has_torch_weights(d, exp_name="zfh") is True
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

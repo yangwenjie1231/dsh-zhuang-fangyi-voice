@@ -41,19 +41,36 @@ _clean_text = None
 _to_seq = None
 _lang_segment = None
 
+# 记住调用方给的 gsv_root。
+#
+# 为什么不把它加进下面每个公开函数的签名：那些函数（`split_by_lang` /
+# `text_to_phonemes_mixed` …）是**纯文本处理**，让它们人人带一个"机器路径"
+# 参数很难看，而且调用方（api / 两个 backend）得一路传。
+# 这里记一次，`prepare()` 用；`_ready` 之前重复调用会更新它。
+_gsv_root = None
+
 # LangSegmenter 返回的语言标签 → 本前端支持的 clean_text 语言
 _SUPPORTED = ("zh", "en", "ja", "ko", "yue")
 
 
-def prepare(model_dir=None):
-    """初始化文本前端（幂等）"""
-    global _ready, _clean_text, _to_seq, _lang_segment
+def prepare(model_dir=None, gsv_root=None):
+    """初始化文本前端（幂等）
+
+    `gsv_root`：GPT-SoVITS 检出根目录。**必须能传进来** —— torch 用户的
+    G2PW / BERT 就在检出里（`<gsv_root>/GPT_SoVITS/text/G2PWModel` 等），
+    只按模型目录找会找不到 → `mixed_available()` 静默为假 →
+    中英混排被降级成中文读法（"Hello World" 念成"哈喽 达布流欧"）。
+    服务进程的命令行本来就带着 `--gsv-root`，所以这条链路是通的。
+    """
+    global _ready, _clean_text, _to_seq, _lang_segment, _gsv_root
+    if gsv_root:
+        _gsv_root = gsv_root
     with _lock:
         if _ready:
             return
         mdir = paths.resolve_model_dir(model_dir)
-        g2pw = paths.g2pw_dir(mdir)
-        bert = paths.bert_dir(mdir)
+        g2pw = paths.g2pw_dir(mdir, _gsv_root)
+        bert = paths.bert_dir(mdir, _gsv_root)
         if not os.path.isdir(g2pw):
             raise FileNotFoundError(f"G2PW 模型目录不存在: {g2pw}")
         if not os.path.isdir(bert):
@@ -92,9 +109,16 @@ def prepare(model_dir=None):
         _ready = True
 
 
-def mixed_available():
-    """中英混排分段是否可用（依赖 nltk / g2p_en / wordsegment）"""
-    prepare()
+def mixed_available(gsv_root=None, model_dir=None):
+    """中英混排分段是否可用（依赖 nltk / g2p_en / wordsegment）
+
+    ⚠️ `model_dir` 与 `gsv_root` **都要传**。踩过的坑：只传 gsv_root 时，
+    内部 `prepare()` → `resolve_model_dir(None)` 会去找**默认**模型目录
+    （仓库 `models/` 或 `~/.cache/zfh-voice/models`），而真实部署用的是
+    `--model-dir` 指定的目录 → 找不到就抛 FileNotFoundError →
+    被 `api._auto_localize()` 吞掉 → **中英混排永远降级成中文读法**。
+    """
+    prepare(model_dir=model_dir, gsv_root=gsv_root)
     return _lang_segment is not None
 
 
