@@ -20,6 +20,105 @@ from .. import audio, frontend, paths
 from .base import (EARLY_STOP, EOS, MAX_LOOP, SAMPLE_RATE, VERSION,
                    BackendError, SynthBackend)
 
+# Kaldi mel 滤波器组缓存（构造一次约 5ms，但每句都要用）
+_FB_CACHE = {}
+
+
+def _mel_filterbank(sr=16000, n_fft=512, n_mels=80, low_freq=20.0, high_freq=None):
+    """Kaldi 风格 mel 滤波器组 —— **逐行对齐上游 `eres2net/kaldi.py:get_mel_banks`**
+
+    与常见的 librosa/Slaney 实现有两点关键差异（踩过才知道）：
+
+      1. **不做 Slaney 面积归一化**。上游直接用三角斜率 `min(up, down)` 并
+         clamp 到 0。加了 `2/(f_hi-f_lo)` 的归一化会让高频通道整体偏低
+         （实测逐维均值差从 −3dB 递增到 −5.5dB）。
+      2. `num_fft_bins = n_fft // 2`（**不是 n_fft//2 + 1**）—— 上游用的是
+         `window_length_padded / 2`，少一个频点。所以返回的列数是 `n_fft//2`，
+         用的时候要配合 `spec[..., :n_fft//2]`。
+
+    mel 公式用 Kaldi 的 `1127 * ln(1 + f/700)`。
+    """
+    if high_freq is None or high_freq <= 0.0:
+        high_freq = 0.5 * sr
+
+    num_fft_bins = n_fft // 2
+    fft_bin_width = sr / n_fft
+
+    mel_low = 1127.0 * np.log(1.0 + low_freq / 700.0)
+    mel_high = 1127.0 * np.log(1.0 + high_freq / 700.0)
+    delta = (mel_high - mel_low) / (n_mels + 1)
+
+    bin_idx = np.arange(n_mels)[:, None]                       # (n_mels, 1)
+    left = mel_low + bin_idx * delta
+    center = mel_low + (bin_idx + 1.0) * delta
+    right = mel_low + (bin_idx + 2.0) * delta
+
+    # 各 FFT 频点对应的 mel 值（注意只有 num_fft_bins 个）
+    mel = 1127.0 * np.log(1.0 + (fft_bin_width * np.arange(num_fft_bins)) / 700.0)[None, :]
+
+    up = (mel - left) / (center - left)
+    down = (right - mel) / (right - center)
+    bins = np.maximum(0.0, np.minimum(up, down))
+    return bins.astype(np.float32)
+
+
+def _kaldi_fbank(x16k, n_mels=80, frame_length_ms=25.0, frame_shift_ms=10.0,
+                 sample_frequency=16000.0, low_freq=20.0, preemphasis=0.97):
+    """Kaldi 兼容的 fbank（**逐项对齐上游 `eres2net/kaldi.py` 的默认参数**）
+
+    为什么要自己实现：上游 `ERes2NetV2` 的 fbank 依赖 `torch.fft.rfft`，
+    而该算子**无法导出到 ONNX**，所以 ONNX 侧只能在 Python 里算。
+
+    对齐的默认值（任何一个错了都会让说话人向量偏移）：
+      · `snip_edges=True`      —— 帧数 = 1 + (N - frame_len) // shift，不做边界补零
+      · `preemphasis_coefficient=0.97` —— **必须做预加重**（曾漏掉，导致与 Kaldi
+        相关系数只有 0.37）
+      · `window_type=povey`    —— hann^0.85
+      · `remove_dc_offset=True`（每帧去均值）、`raw_energy=True`
+      · `round_to_power_of_two=True` —— FFT 长度取 2 的幂（400 → 512）
+      · `use_power=True`（功率谱）、`use_log_fbank=True`
+      · `low_freq=20`、`htk_compat=False`（不做 HTK 的维度换位）
+    """
+    key = (n_mels, frame_length_ms, frame_shift_ms, sample_frequency, low_freq)
+    cached = _FB_CACHE.get(key)
+    if cached is None:
+        frame_len = int(sample_frequency * frame_length_ms / 1000.0)     # 400
+        frame_shift = int(sample_frequency * frame_shift_ms / 1000.0)    # 160
+        n_fft = 1
+        while n_fft < frame_len:          # round_to_power_of_two
+            n_fft *= 2
+        cached = _FB_CACHE[key] = (
+            frame_len, frame_shift, n_fft,
+            _mel_filterbank(sample_frequency, n_fft, n_mels, low_freq))
+    frame_len, frame_shift, n_fft, fb = cached
+
+    x = np.asarray(x16k, dtype=np.float64).reshape(-1)
+    num_samples = len(x)
+
+    # snip_edges=True：只取完整帧
+    if num_samples < frame_len:
+        return np.zeros((0, n_mels), dtype=np.float32)
+    m = 1 + (num_samples - frame_len) // frame_shift
+    idx = np.arange(frame_len)[None, :] + frame_shift * np.arange(m)[:, None]
+    frames = x[idx]
+
+    if True:      # remove_dc_offset
+        frames = frames - frames.mean(axis=1, keepdims=True)
+
+    # preemphasis：y[n] = x[n] - k * x[n-1]（首样本用 x[0] 自身）
+    if preemphasis != 0.0:
+        shifted = np.concatenate([frames[:, :1], frames[:, :-1]], axis=1)
+        frames = frames - preemphasis * shifted
+
+    # povey 窗 = hann^0.85（periodic=False）
+    w = np.hanning(frame_len) ** 0.85
+    frames = frames * w[None, :]
+
+    spec = np.abs(np.fft.rfft(frames, n_fft)) ** 2        # use_power=True
+    # 滤波器组的列数是 n_fft//2（上游 `window_length_padded / 2`，少一个频点）
+    mel = spec[:, : fb.shape[1]] @ fb.T
+    return np.log(np.maximum(mel, 1e-10)).astype(np.float32)
+
 
 class OnnxBackend(SynthBackend):
     name = "onnx"
@@ -59,6 +158,22 @@ class OnnxBackend(SynthBackend):
             if not os.path.exists(p):
                 raise BackendError(f"缺少模型文件: {p}")
             self.sess[key] = ort.InferenceSession(p, so, providers=providers)
+
+        # v2Pro 支持：它比 v2 多一个说话人向量（sv_emb）。
+        # 判定方式是看 `zfh_vits.onnx` 是否声明了该输入 —— 比猜文件名可靠。
+        vits_inputs = {i.name for i in self.sess["vits"].get_inputs()}
+        self.needs_sv = "sv_emb" in vits_inputs
+        self.has_sv_model = os.path.exists(
+            os.path.join(self.model_dir, "sv_after_fbank.onnx"))
+        if self.needs_sv:
+            if not self.has_sv_model:
+                raise BackendError(
+                    "这个 ONNX 包是 v2Pro 的（zfh_vits.onnx 需要 `sv_emb` 输入），"
+                    "但缺少说话人编码器 sv_after_fbank.onnx。\n"
+                    "请下载完整的 v2Pro ONNX 包，或改用 v2 的包。")
+            self.sess["sv"] = ort.InferenceSession(
+                os.path.join(self.model_dir, "sv_after_fbank.onnx"),
+                so, providers=providers)
         self.load_seconds = time.time() - t0
 
         # BERT tokenizer（只需 tokenizer 文件，不需要权重）
@@ -135,12 +250,30 @@ class OnnxBackend(SynthBackend):
         wav, sr = audio.load_wav(ref_wav)
         return audio.resample(wav, sr, SAMPLE_RATE)[None, :].astype(np.float32)
 
+    def _sv_embedding(self, ref_wav):
+        """v2Pro 说话人向量 [1, 20480]
+
+        ⚠️ fbank **必须在 Python 侧算**：上游 ERes2NetV2 的 fbank 用了
+        `torch.fft.rfft`，而 PyTorch 的 ONNX 导出器不支持 `aten::fft_rfft`，
+        所以导出的 `sv_after_fbank.onnx` 只包含 fbank **之后**的网络。
+
+        fbank 参数照抄上游 `Kaldi.fbank(num_mel_bins=80, sample_frequency=16000,
+        dither=0)`：25ms 窗 / 10ms 跳、去均值、povey 窗、log。
+        """
+        wav, sr = audio.load_wav(ref_wav)
+        wav16k = audio.resample(wav, sr, 16000)
+        fb = _kaldi_fbank(wav16k, n_mels=80)          # [T, 80]
+        # 导出时输入是 [B, C, F, T]，所以要转置
+        fb = fb.T[None, None, :, :].astype(np.float32)
+        return self.sess["sv"].run(None, {"fbank": fb})[0]      # [1, 20480]
+
     # ---------------- 主流程 ----------------
     def synth(self, text, ref_wav, ref_text, seed=None, verbose=False):
         text_seq, text_w2p, text_norm, text_bert = self._text_ids(text)
         ref_seq, ref_w2p, ref_norm, ref_bert = self._text_ids(ref_text)
         ssl = self._ssl_content(ref_wav)
         ref32 = self._ref_audio_32k(ref_wav)
+        sv = self._sv_embedding(ref_wav) if self.needs_sv else None
 
         # 1) encoder
         x, prompts = self.sess["encoder"].run(None, {
@@ -170,9 +303,11 @@ class OnnxBackend(SynthBackend):
         ar_seconds = time.time() - t0
 
         # 4) 声码器
-        wav = self.sess["vits"].run(None, {
-            "text_seq": text_seq, "pred_semantic": pred_semantic,
-            "ref_audio": ref32})[0]
+        vits_feed = {"text_seq": text_seq, "pred_semantic": pred_semantic,
+                     "ref_audio": ref32}
+        if self.needs_sv:
+            vits_feed["sv_emb"] = sv
+        wav = self.sess["vits"].run(None, vits_feed)[0]
 
         if verbose:
             print(f"    [onnx] AR {n_steps} 步 {ar_seconds:.1f}s  "
