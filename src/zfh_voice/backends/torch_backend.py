@@ -47,11 +47,35 @@ class TorchBackend(SynthBackend):
             names = []
         return os.path.join(d, names[-1]) if names else pref
 
+    # 推理采样参数的默认值。
+    #
+    # 这些直接决定 AR 解码行为（对「念错」和「糊」都有影响）：
+    #   · top_k 小 → 只从高概率 token 采样，更稳；大 → 更多样
+    #   · temperature 低 → 更确定；高 → 更多样但可能失控
+    #   · repetition_penalty 高 → 抑制重复，但过高会让发音含糊
+    #
+    # 默认值沿用上游/历史上搜得的组合。**想做参数扫描时通过构造参数覆盖** ——
+    # 早先这几个值是硬编码的，外部无法调整，导致无法针对新模型重搜。
+    DEFAULT_SAMPLING = {
+        "top_k": 15,
+        "temperature": 1.0,
+        "repetition_penalty": 1.35,
+    }
+
     def __init__(self, gsv_root, model_dir=None, gpt_path=None,
                  sovits_path=None, ref_wav=None, ref_text=None,
                  device="cuda", is_half=True, exp_name="zfh",
-                 bert_dir=None, hubert_dir=None):
+                 bert_dir=None, hubert_dir=None,
+                 top_k=None, temperature=None, repetition_penalty=None,
+                 top_p=None, speed=None):
         super().__init__(model_dir)
+        # 采样参数：没传就用默认值（保持既有行为不变）
+        self.sampling = dict(self.DEFAULT_SAMPLING)
+        for key, val in (("top_k", top_k), ("temperature", temperature),
+                         ("repetition_penalty", repetition_penalty),
+                         ("top_p", top_p), ("speed", speed)):
+            if val is not None:
+                self.sampling[key] = val
         # 解析模型目录（用于兜底查找 torch_weights/；找不到也不影响，
         # 因为 torch 权重通常直接从 gsv_root 里取）
         if self.model_dir:
@@ -146,8 +170,8 @@ class TorchBackend(SynthBackend):
             "text": text, "text_lang": "zh",
             "ref_audio_path": ref_wav, "prompt_text": ref_text,
             "prompt_lang": "zh",
-            "top_k": 15, "temperature": 1.0, "repetition_penalty": 1.35,
         }
+        inputs.update(self.sampling)      # top_k / temperature / repetition_penalty
         if seed is not None:
             inputs["seed"] = int(seed)
         sr, wav = None, None
