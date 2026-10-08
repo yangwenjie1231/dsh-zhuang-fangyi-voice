@@ -132,3 +132,37 @@ def test_numpy_fallback_matches_scipy(noise):
 def test_describe():
     assert "关闭" in pp.describe(0.0)
     assert "3" in pp.describe(3.0)
+
+
+# ---------- 按模型版本选补偿量 ----------
+#
+# 背景（实测）：v2 的 8–12k 偏亮 4.2dB、12–16k 已对齐，所以需要 +3dB；
+# 而 v2Pro 的频谱本身就接近原声，加 3dB 会**过冲**（长文本频谱偏差 0.88 → 1.92）。
+# 两者起点不同，所以补偿量必须按版本取，不能全局一个值。
+
+def test_gain_v2_needs_compensation():
+    assert pp.gain_for_version("v2") == 3.0
+    assert pp.gain_for_version("v1") == 3.0
+
+
+def test_gain_v2pro_needs_none():
+    """v2Pro 不该补偿 —— 加了会过冲"""
+    assert pp.gain_for_version("v2Pro") == 0.0
+    assert pp.gain_for_version("v2ProPlus") == 0.0
+
+
+def test_gain_unknown_version_is_safe():
+    """未知版本保守返回 0 —— 宁可不动，也不要凭猜测加高频"""
+    for v in ("v9", "unknown", "", None):
+        assert pp.gain_for_version(v) == 0.0, f"{v!r} 应返回 0"
+
+
+def test_gain_for_version_accepts_default():
+    assert pp.gain_for_version("v9", default=1.5) == 1.5
+    assert pp.gain_for_version("v2", default=1.5) == 3.0   # 已知版本仍用表
+
+
+def test_by_version_covers_all_known():
+    """表里应覆盖上游全部 6 个版本（否则用户换版本时会静默落到 0）"""
+    for v in ("v1", "v2", "v3", "v4", "v2Pro", "v2ProPlus"):
+        assert v in pp.BY_VERSION, f"{v} 未在 BY_VERSION 里"

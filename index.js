@@ -107,18 +107,23 @@ export const DOCTOR_TIMEOUT_MS = 30000
 export const DEFAULT_SEED = 42
 
 /**
- * 默认亮度补偿（dB），0 = 关闭。
+ * 默认亮度补偿：`'auto'` = **按模型版本自动选校准值**。
  *
- * 模型输出 32kHz 而素材是 48kHz；48k→32k 下采样在 Nyquist(16kHz) 附近的
- * 抗混叠滚降使 12–16kHz 比原声低约 2.8dB（实测 48k 原声 −46.8dB vs
- * 合成 −49.6dB），听感偏「糊」。
+ * 为什么要 auto：两种模型的**起点不同**，同一个数字会一个补齐、一个过冲。
+ * 实测长文本（421 秒全文，目标为 48k 原声）：
  *
- * 校准所得参数 `fc=12kHz, gain=3dB, Q=1.0`，实测把 12–16kHz 补到 −46.7dB
- * （误差 0.09dB），且 8–12kHz 仅 +0.09dB（不会过亮）。
+ *   v2    未补偿：8–12k 偏亮 4.2dB、12–16k 已对齐 → 需要 **+3dB**
+ *   v2Pro 未补偿：8–12k 已对齐、12–16k 仅差 1.2 → 加 3dB 会**过冲**
+ *                （频谱偏差 0.88 → 1.92）
  *
- * 默认仍为 0（关闭）：这是听感补偿而非信息恢复，应由用户显式开启。
+ * 所以默认 `'auto'`（v2 → 3，v2Pro → 0），用户**不必记住"换模型要改数字"**。
+ *
+ * 想手动控制就给数字：`0` = 显式关闭（逐字节不改动输出），`3` = 强制 +3dB。
+ *
+ * 说明：这是**听感补偿**（恢复 48k→32k 重采样造成的频谱倾斜），
+ * **不是信息恢复** —— 素材本身有效带宽约 16kHz，升采样补不回真实信息。
  */
-export const DEFAULT_BRIGHTNESS_DB = 0
+export const DEFAULT_BRIGHTNESS_DB = 'auto'
 
 /** 启动后等健康检查的最长时间（CUDA 下加载模型可能几十秒）。 */
 export const DEFAULT_START_TIMEOUT_MS = 120000
@@ -211,8 +216,10 @@ export function buildServeCommand (o = {}) {
   } else if (Number.isFinite(Number(seed))) {
     argv.push('--seed', String(Math.floor(Number(seed))))
   }
-  const br = Number(o.brightnessDb)
-  if (Number.isFinite(br) && br !== 0) {
+  // brightnessDb：`'auto'`（默认）**不传参数** —— 让 Python 侧按它加载到的
+  // 模型版本自己选校准值（v2 → 3，v2Pro → 0）。传数字才显式覆盖。
+  const br = o.brightnessDb
+  if (typeof br === 'number' && Number.isFinite(br)) {
     argv.push('--brightness-db', String(br))
   }
   argv.push('serve', '--host', host, '--port', String(port))
@@ -585,10 +592,15 @@ export function normalizeConfig (input, base = defaultConfig()) {
     const sd = Number(input.seed)
     if (Number.isFinite(sd) && sd >= 0 && sd <= 2147483647) out.seed = Math.floor(sd)
   }
-  // brightnessDb: 只允许 0~12dB（再高会明显过亮，校准值是 3）
+  // brightnessDb: `'auto'`（按模型版本自动选）或 0~12 的数字（再高会明显过亮）
   if (input.brightnessDb !== undefined) {
-    const br = Number(input.brightnessDb)
-    if (Number.isFinite(br) && br >= 0 && br <= 12) out.brightnessDb = br
+    if (typeof input.brightnessDb === 'string'
+        && input.brightnessDb.trim().toLowerCase() === 'auto') {
+      out.brightnessDb = 'auto'
+    } else {
+      const br = Number(input.brightnessDb)
+      if (Number.isFinite(br) && br >= 0 && br <= 12) out.brightnessDb = br
+    }
   }
   const idle = Number(input.idleStopSec)
   if (Number.isFinite(idle) && idle >= 0 && idle <= 86400) out.idleStopSec = Math.floor(idle)

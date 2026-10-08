@@ -31,6 +31,13 @@ class SynthBackend:
 
     name = "base"
 
+    # 实际加载的模型版本（子类在初始化时填）。
+    #
+    # 为什么必须暴露它：**亮度补偿的校准值随版本而变**（见 postprocess 模块头）——
+    # v2 需要 +3dB 才对齐原声，而 v2Pro 的频谱本来就接近原声，加 3dB 会**过冲**。
+    # API 层据此自动选补偿量，用户就不必记住"换模型要改数字"。
+    model_version = VERSION
+
     def __init__(self, model_dir=None, **kw):
         self.model_dir = model_dir
 

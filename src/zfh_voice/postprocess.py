@@ -33,6 +33,39 @@ DEFAULT_FC = 12000.0
 DEFAULT_Q = 1.0
 DEFAULT_GAIN_DB = 0.0
 
+# 各模型版本的校准补偿量（dB）。
+#
+# 为什么按版本分开：**补偿的起点不同**。实测长文本（421 秒全文，
+# 目标 = 48k 原声的 8–12k −36.7 / 12–16k −45.25）：
+#
+#   v2    未补偿：8–12k = −32.5（**偏亮 4.2 dB**）、12–16k = −45.6（已对齐）
+#   v2Pro 未补偿：8–12k = −36.6（已对齐）、12–16k = −46.5（仅差 1.2）
+#
+# v2Pro 的频谱**本身就接近原声**，再加 v2 的 3 dB 会**过冲**
+# （12–16k 从 −46.5 冲到 −43.5，频谱偏差合计 1.92，而无补偿是 0.88）。
+#
+# 所以：v2 → 3，v2Pro → 0。
+BY_VERSION = {
+    "v1": 3.0,
+    "v2": 3.0,
+    "v3": 0.0,
+    "v4": 0.0,
+    "v2Pro": 0.0,
+    "v2ProPlus": 0.0,
+}
+
+
+def gain_for_version(version, default=None):
+    """按模型版本取校准补偿量（dB）。
+
+    未知版本返回 `default`（默认 0 = 关闭）——
+    宁可不动，也不要凭猜测往输出里加高频。
+    """
+    fallback = DEFAULT_GAIN_DB if default is None else float(default)
+    if not version:
+        return fallback
+    return BY_VERSION.get(str(version), fallback)
+
 
 def shelf_coeffs(sr: float, fc: float, gain_db: float, q: float):
     """RBJ audio-EQ-cookbook 高通搁架双二阶系数 → (b, a)。

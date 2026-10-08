@@ -84,7 +84,7 @@ class SynthResult:
 class TTS:
     def __init__(self, backend="onnx", model_dir=None, cache_dir=None,
                  ref_wav=None, ref_text=None, use_cache=True, localize="auto",
-                 default_seed=DEFAULT_SEED, brightness_db=0.0,
+                 default_seed=DEFAULT_SEED, brightness_db="auto",
                  **backend_kw):
         self._backend_kind = backend
         # 按后端分别校验：onnx 后端必须有 7 个 ONNX；
@@ -95,8 +95,12 @@ class TTS:
         # 不传 seed 时用的种子；None 表示沿用上游的随机采样（旧行为，不稳定）
         self.default_seed = default_seed
         # 亮度补偿：补偿 48k→32k 重采样在 12–16kHz 的滤波滚降（详见 postprocess）。
-        # 0.0 = 关闭（默认，逐字节不改动输出）
-        self.brightness_db = float(brightness_db or 0.0)
+        #
+        # `"auto"`（默认）= **按模型版本选校准值** —— v2 → +3dB，v2Pro → 0。
+        # 这个默认值是必要的：两者起点不同，v2Pro 套用 v2 的 3dB 会**过冲**。
+        # 给数字则用该数字（0 = 逐字节不改动输出）。
+        self._brightness_cfg = brightness_db
+        self.brightness_db = 0.0     # 真实值在 backend 起来后解析
         # 英文怎么念：auto（默认）/ True（转中文读法）/ False（原样送前端）
         #   auto → 中英混排可用时**原样送**（真英文发音，实测更好）；
         #          不可用时转中文读法兜底（否则英文会被静默删掉）
@@ -200,7 +204,23 @@ class TTS:
             self._backend = make_backend(
                 self._backend_kind, model_dir=self.model_dir, **self._backend_kw)
             self._load_seconds = time.time() - t0
+            self._resolve_brightness()
         return self._backend
+
+    def _resolve_brightness(self):
+        """把 `brightness_db="auto"` 解析成具体数字（按加载到的模型版本）
+
+        `"auto"`：v2 → +3dB、v2Pro → 0。两者起点不同，混用会过冲。
+        显式数字则原样采用（含 0）。
+        """
+        cfg = self._brightness_cfg
+        if isinstance(cfg, str) and cfg.strip().lower() == "auto":
+            ver = getattr(self._backend, "model_version", None)
+            self.brightness_db = postprocess.gain_for_version(ver)
+            self._brightness_version = ver
+        else:
+            self.brightness_db = float(cfg or 0.0)
+            self._brightness_version = getattr(self._backend, "model_version", None)
 
     @property
     def is_loaded(self):
@@ -226,19 +246,35 @@ class TTS:
         return False
 
     # ---------- 缓存 ----------
-    def _cache_key(self, text, seed, brightness_db=0.0):
+    def _cache_key(self, text, seed, brightness_token=0.0):
+        """缓存键
+
+        `brightness_token` 是补偿量的**身份**，不是数值：
+          · 显式数字 → 该数字
+          · `"auto"` → `auto:<模型目录>`（因为 auto 的结果由模型版本决定，
+            而版本来自后端；用目录当代理**不必加载模型**）
+        这样同一句话在 v2 与 v2Pro 下不会互相命中（两者补偿量不同）。
+        """
         h = hashlib.sha1()
         h.update(text.encode("utf-8"))
         h.update(str(seed).encode())
         h.update(self._backend_kind.encode())
-        # 补偿参数必须进键，否则改参数会命中旧缓存
-        h.update(f"br{brightness_db:g}".encode())
+        h.update(str(brightness_token).encode())
         try:
             st = os.stat(self.ref_wav)
             h.update(f"{self.ref_wav}:{st.st_size}:{int(st.st_mtime)}".encode())
         except OSError:
             h.update(self.ref_wav.encode())
         return h.hexdigest()[:16]
+
+    def _brightness_token(self, explicit=None):
+        """给缓存键用的补偿身份（不触发模型加载）"""
+        if explicit is not None:
+            return f"{float(explicit):g}"
+        cfg = getattr(self, "_brightness_cfg", 0.0)
+        if isinstance(cfg, str) and cfg.strip().lower() == "auto":
+            return f"auto:{self.model_dir}"
+        return f"{float(cfg or 0.0):g}"
 
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, f"{key}.wav")
@@ -269,7 +305,21 @@ class TTS:
             raise ValueError("文本为空")
         # seed=None 是「未指定」而非「要随机」—— 用默认种子兜底
         eff_seed = self.default_seed if seed is None else seed
-        eff_br = self.brightness_db if brightness_db is None else float(brightness_db)
+        # 亮度补偿：传数字用它；不传则按实例配置（默认 `"auto"`，按模型版本选）。
+        #
+        # ⚠️ auto 需要**加载后端才知道版本**，但**不能在这里就加载** ——
+        # 下面还有"文本是否可发音"的提前校验，那是为了在**不加载模型**的前提下
+        # 拦住纯符号输入（否则用户要等几十秒加载完才被告知文本不对）。
+        # 所以这里只算"要 auto"，真正取值推迟到确认文本可用之后。
+        want_auto = (brightness_db is None
+                     and isinstance(getattr(self, "_brightness_cfg", 0.0), str)
+                     and self._brightness_cfg.strip().lower() == "auto")
+        if brightness_db is not None:
+            eff_br = float(brightness_db)
+        elif want_auto:
+            eff_br = None                    # 待解析
+        else:
+            eff_br = float(getattr(self, "_brightness_cfg", 0.0) or 0.0)
         do_localize = self._resolve_localize(localize)
         spoken = textprep.localize(text) if do_localize else text
         # 提前拦住"念不出声"的输入 —— 否则后端会产出 0 音素并抛出
@@ -286,8 +336,10 @@ class TTS:
                    "当前环境不支持英文发音（缺 nltk/g2p_en 等），"
                    "请设 TTS(localize=True) 用中文读法念英文。"))
         use_cache = self.use_cache if use_cache is None else use_cache
-        # 缓存键用**转换后**的文本：同一句的不同写法若读法相同，可复用
-        key = self._cache_key(spoken, eff_seed, eff_br)
+        # 缓存键用**转换后**的文本：同一句的不同写法若读法相同，可复用。
+        # 用 token（而非数值）——`auto` 的数值要加载模型才知道，而这一步不能加载。
+        key = self._cache_key(spoken, eff_seed,
+                              self._brightness_token(brightness_db))
         cp = self._cache_path(key)
 
         if use_cache and os.path.exists(cp):
@@ -297,6 +349,11 @@ class TTS:
             if out:
                 r.save(out)
             return r
+
+        # 现在才允许触发后端加载（文本已确认可用）
+        if eff_br is None:
+            _ = self.backend            # 触发 _resolve_brightness
+            eff_br = self.brightness_db
 
         t0 = time.time()
         wav, sr = self.backend.synth(

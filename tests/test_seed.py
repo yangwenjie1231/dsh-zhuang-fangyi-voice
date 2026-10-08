@@ -46,7 +46,12 @@ def _tts(tmp_path, monkeypatch, **kw):
     tts.model_dir = tmp_path
     tts.use_cache = True
     tts.default_seed = kw.pop("default_seed", DEFAULT_SEED)
-    tts.brightness_db = float(kw.pop("brightness_db", 0.0))
+    # 补偿量是**两段式**的：`_brightness_cfg` 是配置（可以是 "auto"），
+    # `brightness_db` 是解析后的数值。这里模拟"已解析"的状态。
+    br = float(kw.pop("brightness_db", 0.0))
+    tts._brightness_cfg = br
+    tts.brightness_db = br
+    tts._brightness_version = "v2"
     tts.localize = False
     tts._localize_auto = False
     tts._localize_reason = "test"
@@ -165,7 +170,12 @@ def test_remote_say_forwards_brightness(monkeypatch):
     assert captured["payload"]["seed"] == 42
 
 
-def test_remote_say_default_brightness_is_zero(monkeypatch):
+def test_remote_say_default_brightness_is_omitted(monkeypatch):
+    """不指定亮度时**不应**在请求体里带该字段
+
+    让服务端用它自己的默认值（同样是 auto，按它加载的模型版本选）。
+    显式传 0 才表示"我要关掉" —— 两者语义不同，不能混。
+    """
     from zfh_voice import cli
 
     captured = {}
@@ -173,7 +183,20 @@ def test_remote_say_default_brightness_is_zero(monkeypatch):
         cli, "_server_post",
         lambda s, p, payload=None, timeout=600: (captured.update(payload), b"RIFF")[1])
     cli._remote_say("http://x", "你好", 42, None)
-    assert captured["brightness_db"] == 0.0
+    assert "brightness_db" not in captured, \
+        f"未指定时不该带 brightness_db，实际: {captured}"
+
+
+def test_remote_say_explicit_zero_is_sent(monkeypatch):
+    """显式传 0 必须发出去（表示"关掉"，与"未指定"不同）"""
+    from zfh_voice import cli
+
+    captured = {}
+    monkeypatch.setattr(
+        cli, "_server_post",
+        lambda s, p, payload=None, timeout=600: (captured.update(payload), b"RIFF")[1])
+    cli._remote_say("http://x", "你好", 42, None, brightness_db=0.0)
+    assert captured.get("brightness_db") == 0.0
 
 
 def test_server_forwards_brightness_to_tts():

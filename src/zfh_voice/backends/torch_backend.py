@@ -128,6 +128,12 @@ class TorchBackend(SynthBackend):
         self.ref_wav = ref_wav
         self.ref_text = ref_text
         self.device = device
+        # 上游会从权重文件头探测版本（`get_sovits_version_from_path_fast`），
+        # 这里读回来暴露给 API 层 —— 它据此选亮度补偿量（v2Pro 不需要补偿）。
+        try:
+            self.model_version = str(self.tts.configs.version)
+        except Exception:  # noqa: BLE001
+            self.model_version = "v2"
 
     def synth(self, text, ref_wav, ref_text, seed=None, verbose=False):
         import numpy as np

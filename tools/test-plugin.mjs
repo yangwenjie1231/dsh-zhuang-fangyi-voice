@@ -539,15 +539,17 @@ ok('seed 非法值被过滤', () => {
   assert.equal(normalizeConfig({ seed: 1e12 }).seed, 42, '超 int32 回落默认')
 })
 
-ok('⭐ 亮度补偿默认 0 = 关闭（输出逐字节不变）', () => {
-  assert.equal(DEFAULT_BRIGHTNESS_DB, 0)
-  assert.equal(defaultConfig().brightnessDb, 0)
-  // 0 时**不传参数**，保证默认路径与改动前完全一致
-  const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 0 })
-  assert.ok(!c.argv.includes('--brightness-db'), '0 不该传参数')
+ok('⭐ 亮度补偿默认 auto（按模型版本自动选，避免换模型过冲）', () => {
+  // 为什么是 auto 而不是固定数字：v2 需要 +3dB 才对齐原声，
+  // 而 v2Pro 的频谱本来就接近原声，加 3dB 会**过冲**（偏差 0.88 → 1.92）。
+  assert.equal(DEFAULT_BRIGHTNESS_DB, 'auto')
+  assert.equal(defaultConfig().brightnessDb, 'auto')
+  // auto 时**不传参数**，交给 Python 侧按加载到的版本自己决定
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 'auto' })
+  assert.ok(!c.argv.includes('--brightness-db'), 'auto 不该传参数')
 })
 
-ok('⭐ 亮度补偿非 0 时传参，且在 `serve` 之前', () => {
+ok('⭐ 亮度补偿显式数字才传参，且在 `serve` 之前', () => {
   const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 3 })
   const i = c.argv.indexOf('serve')
   assert.ok(c.argv.indexOf('--brightness-db') > 0)
@@ -555,13 +557,22 @@ ok('⭐ 亮度补偿非 0 时传参，且在 `serve` 之前', () => {
   assert.equal(c.argv[c.argv.indexOf('--brightness-db') + 1], '3')
 })
 
-ok('brightnessDb 夹取到 0~12（防过亮）', () => {
+ok('⭐ brightnessDb=0 也传参（与 auto 语义不同：显式关闭）', () => {
+  const c = buildServeCommand({ python: 'p', repoDir: 'R', brightnessDb: 0 })
+  assert.ok(c.argv.includes('--brightness-db'),
+    '0 是"显式关闭"，必须发出去，不能与 auto 混为一谈')
+  assert.equal(c.argv[c.argv.indexOf('--brightness-db') + 1], '0')
+})
+
+ok('brightnessDb 只接受 auto 或 0~12（防过亮）', () => {
+  assert.equal(normalizeConfig({ brightnessDb: 'auto' }).brightnessDb, 'auto')
+  assert.equal(normalizeConfig({ brightnessDb: 'AUTO' }).brightnessDb, 'auto')
   assert.equal(normalizeConfig({ brightnessDb: 3 }).brightnessDb, 3)
   assert.equal(normalizeConfig({ brightnessDb: 0 }).brightnessDb, 0)
   assert.equal(normalizeConfig({ brightnessDb: 12 }).brightnessDb, 12)
-  assert.equal(normalizeConfig({ brightnessDb: -1 }).brightnessDb, 0, '负数回落 0')
-  assert.equal(normalizeConfig({ brightnessDb: 99 }).brightnessDb, 0, '过大回落 0')
-  assert.equal(normalizeConfig({ brightnessDb: 'x' }).brightnessDb, 0)
+  assert.equal(normalizeConfig({ brightnessDb: -1 }).brightnessDb, 'auto', '负数回落默认')
+  assert.equal(normalizeConfig({ brightnessDb: 99 }).brightnessDb, 'auto', '过大回落默认')
+  assert.equal(normalizeConfig({ brightnessDb: 'x' }).brightnessDb, 'auto')
 })
 
 ok('doctor 命令沿用同一套 seed/brightness 参数（体检的就是要跑的那套）', () => {

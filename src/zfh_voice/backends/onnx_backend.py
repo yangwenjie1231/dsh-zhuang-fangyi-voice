@@ -174,6 +174,8 @@ class OnnxBackend(SynthBackend):
             self.sess["sv"] = ort.InferenceSession(
                 os.path.join(self.model_dir, "sv_after_fbank.onnx"),
                 so, providers=providers)
+        # 供 API 层选亮度补偿量（v2Pro 不需要补偿，加了会过冲）
+        self.model_version = "v2Pro" if self.needs_sv else "v2"
         self.load_seconds = time.time() - t0
 
         # BERT tokenizer（只需 tokenizer 文件，不需要权重）

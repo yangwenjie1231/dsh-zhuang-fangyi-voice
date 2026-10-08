@@ -37,11 +37,13 @@ def _build_tts(args):
             kw["device"] = args.device
     # --random-seed 显式要求不固定种子（default_seed=None 会透传给后端）
     dseed = None if getattr(args, "random_seed", False) else 42
+    # --brightness-db 不传 → None → 交给 TTS 走 "auto"（按模型版本选校准值）
+    br = getattr(args, "brightness_db", None)
     return TTS(backend=args.backend, model_dir=args.model_dir,
                ref_wav=args.ref, ref_text=args.ref_text,
                use_cache=not args.no_cache,
                default_seed=dseed,
-               brightness_db=getattr(args, "brightness_db", 0.0),
+               brightness_db=("auto" if br is None else br),
                localize=(args.localize if args.localize is not None else "auto"),
                **kw)
 
@@ -78,10 +80,17 @@ def _server_alive(server, timeout=2):
         return False
 
 
-def _remote_say(server, text, seed, out=None, brightness_db=0.0):
-    """通过常驻服务合成，返回 (wav_bytes, out_path)"""
-    audio = _server_post(server, "/tts", {"text": text, "seed": seed,
-                                          "brightness_db": brightness_db})
+def _remote_say(server, text, seed, out=None, brightness_db=None):
+    """通过常驻服务合成，返回 (wav_bytes, out_path)
+
+    `brightness_db=None` → 请求体里**不带**该字段，让服务端用它自己的
+    默认值（同样是 auto，按它加载的模型版本选）。
+    传数字（含 0）才会显式覆盖。
+    """
+    payload = {"text": text, "seed": seed}
+    if brightness_db is not None:
+        payload["brightness_db"] = brightness_db
+    audio = _server_post(server, "/tts", payload)
     if out:
         os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
         with open(out, "wb") as f:
@@ -233,10 +242,10 @@ def main(argv=None):
                     help="不固定种子，走上游随机采样。"
                          "**不推荐**：短句会不稳定（实测 4 字句时长波动 23.5%%，"
                          "偶发截断到正常时长的一半）")
-    ap.add_argument("--brightness-db", type=float, default=0.0,
+    ap.add_argument("--brightness-db", type=float, default=None,
                     help="亮度补偿（dB），补偿 48k→32k 重采样在 12–16kHz 的"
-                         "滤波滚降。0 = 关闭（默认，输出逐字节不变）；"
-                         "校准值 3.0")
+                         "滤波滚降。**不传 = auto**（按模型版本选校准值："
+                         "v2 → 3，v2Pro → 0）；传 0 则显式关闭。")
     ap.add_argument("--no-cache", action="store_true", help="禁用合成缓存")
     ap.add_argument("--localize", dest="localize", action="store_true",
                     default=None,
